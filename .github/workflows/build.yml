@@ -1,0 +1,78 @@
+name: Titan APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      tracking_id:
+        required: true
+      source_branch:
+        required: true
+      keystore_password:
+        required: true
+      key_alias:
+        required: true
+      key_password:
+        required: true
+      webhook_url:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.source_branch }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Initialize App & Dependencies
+        run: |
+          flutter create --platforms=android .
+          flutter pub get
+
+      - name: Build Release APK
+        run: flutter build apk --release
+
+      - name: Generate Keystore & Sign APK
+        run: |
+          keytool -genkey -v -keystore release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias "${{ github.event.inputs.key_alias }}" -storepass "${{ github.event.inputs.keystore_password }}" -keypass "${{ github.event.inputs.key_password }}" -dname "CN=Titan, OU=App, O=Titan, L=City, S=State, C=US"
+          BUILD_TOOLS=$(ls -d $ANDROID_SDK_ROOT/build-tools/* | tail -1)
+          $BUILD_TOOLS/apksigner sign --ks release.jks --ks-key-alias "${{ github.event.inputs.key_alias }}" --ks-pass "pass:${{ github.event.inputs.keystore_password }}" --key-pass "pass:${{ github.event.inputs.key_password }}" build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Send Webhook Callback
+        if: always()
+        run: |
+          STATUS="success"
+          if [ "${{ job.status }}" != "success" ]; then STATUS="failure"; fi
+          
+          curl -X POST "${{ github.event.inputs.webhook_url }}?tracking_id=${{ github.event.inputs.tracking_id }}" \
+            -H "Content-Type: application/json" \
+            -H "x-github-event: workflow_run" \
+            -d '{
+              "action": "completed",
+              "workflow_run": {
+                "status": "completed",
+                "conclusion": "'$STATUS'",
+                "html_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                "artifacts_url": "${{ github.api_url }}/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts",
+                "head_branch": "${{ github.event.inputs.source_branch }}"
+              },
+              "repository": { "full_name": "${{ github.repository }}" }
+            }'
