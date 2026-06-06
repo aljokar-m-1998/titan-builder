@@ -1,17 +1,16 @@
-name: Titan APK Builder
+name: Titan WebView Builder
 
 on:
   workflow_dispatch:
     inputs:
+      app_url:
+        required: true
+      app_name:
+        required: true
+      icon_url:
+        required: false
+        default: ''
       tracking_id:
-        required: true
-      source_branch:
-        required: true
-      keystore_password:
-        required: true
-      key_alias:
-        required: true
-      key_password:
         required: true
       webhook_url:
         required: true
@@ -20,48 +19,60 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.source_branch }}
+      - uses: actions/checkout@v4
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
           java-version: '17'
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
 
-      - name: Initialize App & Dependencies
+      - name: Create Flutter WebView project
         run: |
-          flutter create --platforms=android .
-          flutter pub get
+          flutter create --platforms=android webview_app
+          cd webview_app
+          flutter pub add webview_flutter
 
-      - name: Build Release APK
+      - name: Inject URL and app name
+        run: |
+          cat > webview_app/lib/main.dart << 'DART'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+          void main() => runApp(const MyApp());
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+              title: '${{ github.event.inputs.app_name }}',
+              home: Scaffold(
+                body: WebViewWidget(
+                  controller: WebViewController()
+                    ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                    ..loadRequest(Uri.parse('${{ github.event.inputs.app_url }}')),
+                ),
+              ),
+            );
+          }
+          DART
+
+      - name: Build APK
+        working-directory: webview_app
         run: flutter build apk --release
 
-      - name: Generate Keystore & Sign APK
-        run: |
-          keytool -genkey -v -keystore release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias "${{ github.event.inputs.key_alias }}" -storepass "${{ github.event.inputs.keystore_password }}" -keypass "${{ github.event.inputs.key_password }}" -dname "CN=Titan, OU=App, O=Titan, L=City, S=State, C=US"
-          BUILD_TOOLS=$(ls -d $ANDROID_SDK_ROOT/build-tools/* | tail -1)
-          $BUILD_TOOLS/apksigner sign --ks release.jks --ks-key-alias "${{ github.event.inputs.key_alias }}" --ks-pass "pass:${{ github.event.inputs.keystore_password }}" --key-pass "pass:${{ github.event.inputs.key_password }}" build/app/outputs/flutter-apk/app-release.apk
-
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          name: webview-apk
+          path: webview_app/build/app/outputs/flutter-apk/app-release.apk
 
-      - name: Send Webhook Callback
+      - name: Send webhook callback
         if: always()
         run: |
           STATUS="success"
           if [ "${{ job.status }}" != "success" ]; then STATUS="failure"; fi
-          
           curl -X POST "${{ github.event.inputs.webhook_url }}?tracking_id=${{ github.event.inputs.tracking_id }}" \
             -H "Content-Type: application/json" \
             -H "x-github-event: workflow_run" \
@@ -72,7 +83,7 @@ jobs:
                 "conclusion": "'$STATUS'",
                 "html_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
                 "artifacts_url": "${{ github.api_url }}/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts",
-                "head_branch": "${{ github.event.inputs.source_branch }}"
+                "head_branch": "main"
               },
               "repository": { "full_name": "${{ github.repository }}" }
             }'
