@@ -64,19 +64,14 @@ jobs:
           APP_NAME="${{ github.event.inputs.app_name }}"
           MANIFEST="$APP_SLUG/android/app/src/main/AndroidManifest.xml"
 
-          # Permissions (تم إضافة صلاحية الإشعارات الخاصة بأندرويد 13+)
           sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.DOWNLOAD_WITHOUT_NOTIFICATION"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <application|' "$MANIFEST"
 
-          # Allow cleartext + enable hardware acceleration
           sed -i 's|<application|<application android:usesCleartextTraffic="true" android:hardwareAccelerated="true"|' "$MANIFEST"
 
-          # App name
           sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_NAME\"/" "$MANIFEST"
 
-          # Enable file provider for downloads
           sed -i 's|</application>|    <provider\n            android:name="androidx.core.content.FileProvider"\n            android:authorities="${applicationId}.fileprovider"\n            android:exported="false"\n            android:grantUriPermissions="true">\n            <meta-data\n                android:name="android.support.FILE_PROVIDER_PATHS"\n                android:resource="@xml/file_paths"/>\n        </provider>\n    </application>|' "$MANIFEST"
 
-          # Create file_paths.xml for FileProvider
           mkdir -p "$APP_SLUG/android/app/src/main/res/xml"
           cat > "$APP_SLUG/android/app/src/main/res/xml/file_paths.xml" << 'XML'
           <?xml version="1.0" encoding="utf-8"?>
@@ -105,10 +100,12 @@ jobs:
           const String kAppUrl = 'PLACEHOLDER_URL';
           const String kAppName = 'PLACEHOLDER_NAME';
 
+          // User-Agent قياسي لخداع أنظمة حماية جوجل
+          const String kSecureUserAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36";
+
           void main() async {
             WidgetsFlutterBinding.ensureInitialized();
             SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-            // تفعيل الـ cookies للأندرويد
             await CookieManager.instance().setCookie(
               url: WebUri(kAppUrl),
               name: '',
@@ -162,7 +159,6 @@ jobs:
             }
 
             void _requestPermissions() async {
-              // إضافة طلب صلاحية الإشعارات هنا
               await [
                 Permission.camera,
                 Permission.microphone,
@@ -215,7 +211,12 @@ jobs:
                             thirdPartyCookiesEnabled: true,
                             allowFileAccessFromFileURLs: true,
                             allowUniversalAccessFromFileURLs: true,
-                            userAgent: "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+                            
+                            // استخدام User-Agent المموه هنا
+                            userAgent: kSecureUserAgent,
+                            
+                            // ⚠️ تم حذف applicationNameForUserAgent لمنع كشف التطبيق
+                            
                             useShouldOverrideUrlLoading: true,
                             useOnDownloadStart: true,
                             useOnLoadResource: false,
@@ -224,8 +225,7 @@ jobs:
                             displayZoomControls: false,
                             domStorageEnabled: true,
                             databaseEnabled: true,
-                            applicationNameForUserAgent: kAppName,
-                            supportMultipleWindows: true, // مهم جداً لتسجيل الدخول
+                            supportMultipleWindows: true,
                             cacheEnabled: true,
                             clearCache: false,
                             mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
@@ -285,7 +285,6 @@ jobs:
                             return NavigationActionPolicy.ALLOW;
                           },
                           
-                          // -- التعديل الجذري لحل مشكلة الشاشة البيضاء في النوافذ المنبثقة --
                           onCreateWindow: (controller, createWindowAction) async {
                             showDialog(
                               context: context,
@@ -310,7 +309,11 @@ jobs:
                                             initialSettings: InAppWebViewSettings(
                                               javaScriptEnabled: true,
                                               thirdPartyCookiesEnabled: true,
-                                              userAgent: "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+                                              
+                                              // استخدام نفس User-Agent المموه في النافذة المنبثقة أيضاً
+                                              userAgent: kSecureUserAgent,
+                                              
+                                              // منع إضافة أي معلومات تشير إلى أنه تطبيق
                                             ),
                                             onCloseWindow: (controller) async {
                                               if (Navigator.canPop(context)) {
@@ -327,7 +330,6 @@ jobs:
                             );
                             return true;
                           },
-                          // -------------------------------------------------------------
 
                           onDownloadStartRequest: (controller, downloadStartRequest) async {
                             final url = downloadStartRequest.url.toString();
@@ -337,7 +339,6 @@ jobs:
                           },
                         ),
 
-                        // ── Loading Indicator ──
                         if (_isLoading && !_hasError)
                           const Positioned(
                             top: 0, left: 0, right: 0,
@@ -348,7 +349,6 @@ jobs:
                             ),
                           ),
 
-                        // ── Offline Screen ──
                         if (_isOffline)
                           Container(
                             color: Colors.white,
@@ -378,7 +378,6 @@ jobs:
                             ),
                           ),
 
-                        // ── Error Screen ──
                         if (_hasError && !_isOffline)
                           Container(
                             color: Colors.white,
@@ -428,7 +427,6 @@ jobs:
           APP_NAME="${{ github.event.inputs.app_name }}"
           APP_URL="${{ github.event.inputs.app_url }}"
 
-          # استبدال الـ placeholders بالقيم الحقيقية
           sed -i "s|PLACEHOLDER_URL|$APP_URL|g" "$APP_SLUG/lib/main.dart"
           sed -i "s|PLACEHOLDER_NAME|$APP_NAME|g" "$APP_SLUG/lib/main.dart"
 
@@ -444,7 +442,6 @@ jobs:
             if [ -f /tmp/app_icon.png ] && [ -s /tmp/app_icon.png ]; then
               sudo apt-get install -y imagemagick 2>/dev/null | tail -1
 
-              # Generate all required icon sizes
               for size in 48 72 96 144 192; do
                 case $size in
                   48)  dir="mipmap-mdpi"    ;;
