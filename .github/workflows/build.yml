@@ -51,19 +51,41 @@ jobs:
             "$APP_SLUG"
 
           cd "$APP_SLUG"
-          flutter pub add flutter_inappwebview connectivity_plus permission_handler url_launcher
+          flutter pub add \
+            flutter_inappwebview \
+            connectivity_plus \
+            permission_handler \
+            url_launcher \
+            shared_preferences
 
-      - name: Inject Permissions and App Name
+      - name: Inject Permissions and Manifest Settings
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
           APP_NAME="${{ github.event.inputs.app_name }}"
-          
           MANIFEST="$APP_SLUG/android/app/src/main/AndroidManifest.xml"
 
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <application|' "$MANIFEST"
+          # Permissions
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.DOWNLOAD_WITHOUT_NOTIFICATION"/>\n    <application|' "$MANIFEST"
 
-          sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MANIFEST"
+          # Allow cleartext + enable hardware acceleration (needed for WebView)
+          sed -i 's|<application|<application android:usesCleartextTraffic="true" android:hardwareAccelerated="true"|' "$MANIFEST"
+
+          # App name
           sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_NAME\"/" "$MANIFEST"
+
+          # Enable file provider for downloads (inside <application> tag)
+          sed -i 's|</application>|    <provider\n            android:name="androidx.core.content.FileProvider"\n            android:authorities="${applicationId}.fileprovider"\n            android:exported="false"\n            android:grantUriPermissions="true">\n            <meta-data\n                android:name="android.support.FILE_PROVIDER_PATHS"\n                android:resource="@xml/file_paths"/>\n        </provider>\n    </application>|' "$MANIFEST"
+
+          # Create file_paths.xml for FileProvider
+          mkdir -p "$APP_SLUG/android/app/src/main/res/xml"
+          cat > "$APP_SLUG/android/app/src/main/res/xml/file_paths.xml" << 'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <external-path name="external_files" path="."/>
+              <files-path name="internal_files" path="."/>
+              <cache-path name="cache" path="."/>
+          </paths>
+          XML
 
       - name: Inject Professional main.dart
         run: |
@@ -78,10 +100,20 @@ jobs:
           import 'package:connectivity_plus/connectivity_plus.dart';
           import 'package:permission_handler/permission_handler.dart';
           import 'package:url_launcher/url_launcher.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+
+          const String kAppUrl = 'PLACEHOLDER_URL';
+          const String kAppName = 'PLACEHOLDER_NAME';
 
           void main() async {
             WidgetsFlutterBinding.ensureInitialized();
             SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+            // تفعيل الـ cookies للأندرويد
+            await CookieManager.instance().setCookie(
+              url: WebUri(kAppUrl),
+              name: '',
+              value: '',
+            );
             runApp(const MyApp());
           }
 
@@ -90,9 +122,12 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: 'Titan App',
+                title: kAppName,
                 debugShowCheckedModeBanner: false,
-                theme: ThemeData(useMaterial3: true),
+                theme: ThemeData(
+                  useMaterial3: true,
+                  colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+                ),
                 home: const WebViewPage(),
               );
             }
@@ -104,27 +139,53 @@ jobs:
             State<WebViewPage> createState() => _WebViewPageState();
           }
 
-          class _WebViewPageState extends State<WebViewPage> {
+          class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
             InAppWebViewController? _webViewController;
             bool _isLoading = true;
             bool _isOffline = false;
+            bool _hasError = false;
+            String _currentUrl = kAppUrl;
 
             @override
             void initState() {
               super.initState();
-              _checkPermissions();
+              WidgetsBinding.instance.addObserver(this);
+              _requestPermissions();
               _checkConnectivity();
+              _listenConnectivity();
             }
 
-            void _checkPermissions() async {
-              await [Permission.camera, Permission.microphone, Permission.storage].request();
+            @override
+            void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
+              super.dispose();
+            }
+
+            void _requestPermissions() async {
+              await [
+                Permission.camera,
+                Permission.microphone,
+                Permission.storage,
+              ].request();
             }
 
             void _checkConnectivity() async {
-              var connectivityResult = await (Connectivity().checkConnectivity());
-              setState(() {
-                // استخدام الطريقة الحديثة لتوافق الإصدارات الجديدة من المكتبة
-                _isOffline = connectivityResult.contains(ConnectivityResult.none);
+              final result = await Connectivity().checkConnectivity();
+              if (mounted) {
+                setState(() => _isOffline = result.contains(ConnectivityResult.none));
+              }
+            }
+
+            void _listenConnectivity() {
+              Connectivity().onConnectivityChanged.listen((results) {
+                if (mounted) {
+                  final wasOffline = _isOffline;
+                  setState(() => _isOffline = results.contains(ConnectivityResult.none));
+                  // إذا رجع الإنترنت وكان في خطأ، نعيد التحميل
+                  if (wasOffline && !_isOffline && _hasError) {
+                    _webViewController?.reload();
+                  }
+                }
               });
             }
 
@@ -141,56 +202,218 @@ jobs:
                   }
                 },
                 child: Scaffold(
+                  backgroundColor: Colors.white,
                   body: SafeArea(
                     child: Stack(
                       children: [
+
+                        // ── WebView ──
                         InAppWebView(
-                          // استخدام متغير ليتم استبداله بأمان لاحقاً لتجنب تعارض رموز الرابط في الـ Bash
-                          initialUrlRequest: URLRequest(url: WebUri(const String.fromEnvironment('APP_URL', defaultValue: 'https://google.com'))),
+                          initialUrlRequest: URLRequest(url: WebUri(kAppUrl)),
                           initialSettings: InAppWebViewSettings(
+                            // JavaScript
                             javaScriptEnabled: true,
-                            useShouldOverrideUrlLoading: true,
-                            useOnDownloadStart: true,
-                            userAgent: "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
-                            supportZoom: true,
+                            javaScriptCanOpenWindowsAutomatically: true,
+
+                            // Cookies & Sessions (مهم لتسجيل الدخول)
+                            thirdPartyCookiesEnabled: true,
                             allowFileAccessFromFileURLs: true,
                             allowUniversalAccessFromFileURLs: true,
+
+                            // User Agent يحاكي Chrome على أندرويد
+                            userAgent: "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+
+                            // إعدادات متقدمة
+                            useShouldOverrideUrlLoading: true,
+                            useOnDownloadStart: true,
+                            useOnLoadResource: false,
+                            supportZoom: true,
+                            builtInZoomControls: false,
+                            displayZoomControls: false,
+                            domStorageEnabled: true,
+                            databaseEnabled: true,
+                            applicationNameForUserAgent: kAppName,
+
+                            // دعم الـ popup windows (مهم لـ OAuth)
+                            supportMultipleWindows: true,
+
+                            // منع cache الخاطئ
+                            cacheEnabled: true,
+                            clearCache: false,
+
+                            // Mixed content (HTTP في HTTPS)
+                            mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
+
+                            // Geolocation
+                            geolocationEnabled: true,
+
+                            // Media autoplay
+                            mediaPlaybackRequiresUserGesture: false,
                           ),
+
                           onWebViewCreated: (controller) {
                             _webViewController = controller;
                           },
+
                           onLoadStart: (controller, url) {
-                            setState(() => _isLoading = true);
+                            if (mounted) setState(() {
+                              _isLoading = true;
+                              _hasError  = false;
+                              _currentUrl = url?.toString() ?? kAppUrl;
+                            });
                           },
-                          onLoadStop: (controller, url) {
-                            setState(() => _isLoading = false);
+
+                          onLoadStop: (controller, url) async {
+                            if (mounted) setState(() => _isLoading = false);
+                            // حفظ الـ URL الحالي لاستعادته عند الرجوع
+                            final prefs = await SharedPreferences.getInstance();
+                            await prefs.setString('lastUrl', url?.toString() ?? kAppUrl);
                           },
-                          shouldOverrideUrlLoading: (controller, navigationAction) async {
-                            var uri = navigationAction.request.url;
-                            if (uri != null && (!uri.scheme.startsWith('http') && !uri.scheme.startsWith('https'))) {
-                              if (await canLaunchUrl(uri)) {
-                                await launchUrl(uri, mode: LaunchMode.externalApplication);
-                                return NavigationActionPolicy.CANCEL;
-                              }
+
+                          onReceivedError: (controller, request, error) {
+                            // تجاهل أخطاء الموارد الثانوية (صور، خطوط...)
+                            if (request.isForMainFrame == true) {
+                              if (mounted) setState(() {
+                                _isLoading = false;
+                                _hasError  = true;
+                              });
                             }
+                          },
+
+                          onPermissionRequest: (controller, request) async {
+                            return PermissionResponse(
+                              resources: request.resources,
+                              action: PermissionResponseAction.GRANT,
+                            );
+                          },
+
+                          onGeolocationPermissionsShowPrompt: (controller, origin) async {
+                            return GeolocationPermissionShowPromptResponse(
+                              origin: origin,
+                              allow: true,
+                              retain: true,
+                            );
+                          },
+
+                          // معالجة الـ URL loading — مهم لتسجيل الدخول والـ OAuth
+                          shouldOverrideUrlLoading: (controller, navigationAction) async {
+                            final uri = navigationAction.request.url;
+                            if (uri == null) return NavigationActionPolicy.ALLOW;
+
+                            final scheme = uri.scheme.toLowerCase();
+
+                            // السماح لـ HTTP و HTTPS دائماً
+                            if (scheme == 'http' || scheme == 'https') {
+                              return NavigationActionPolicy.ALLOW;
+                            }
+
+                            // فتح الـ deep links والـ custom schemes خارجياً
+                            if (await canLaunchUrl(uri)) {
+                              await launchUrl(uri, mode: LaunchMode.externalApplication);
+                              return NavigationActionPolicy.CANCEL;
+                            }
+
                             return NavigationActionPolicy.ALLOW;
                           },
+
+                          // دعم الـ popup windows (OAuth, Social Login)
+                          onCreateWindow: (controller, createWindowAction) async {
+                            final windowUrl = createWindowAction.request.url;
+                            if (windowUrl != null) {
+                              // فتح الـ popup في نفس الـ WebView
+                              await controller.loadUrl(
+                                urlRequest: URLRequest(url: windowUrl),
+                              );
+                            }
+                            return true;
+                          },
+
+                          // تحميل الملفات
+                          onDownloadStartRequest: (controller, downloadStartRequest) async {
+                            final url = downloadStartRequest.url.toString();
+                            if (await canLaunchUrl(Uri.parse(url))) {
+                              await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+                            }
+                          },
                         ),
-                        if (_isLoading) 
-                          const Center(child: CircularProgressIndicator(color: Colors.blue)),
+
+                        // ── Loading Indicator ──
+                        if (_isLoading && !_hasError)
+                          const Positioned(
+                            top: 0, left: 0, right: 0,
+                            child: LinearProgressIndicator(
+                              backgroundColor: Colors.transparent,
+                              color: Colors.blue,
+                              minHeight: 3,
+                            ),
+                          ),
+
+                        // ── Offline Screen ──
                         if (_isOffline)
                           Container(
-                            color: Colors.white.withOpacity(0.8),
-                            child: const Center(
+                            color: Colors.white,
+                            child: Center(
                               child: Column(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  Icon(Icons.wifi_off, size: 64, color: Colors.red),
-                                  Text("لا يوجد اتصال بالإنترنت", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                                  const Icon(Icons.wifi_off_rounded, size: 72, color: Color(0xFFE53935)),
+                                  const SizedBox(height: 16),
+                                  const Text(
+                                    'لا يوجد اتصال بالإنترنت',
+                                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF212121)),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  const Text('تحقق من الاتصال وحاول مجدداً', style: TextStyle(color: Color(0xFF757575))),
+                                  const SizedBox(height: 24),
+                                  ElevatedButton.icon(
+                                    onPressed: () {
+                                      _checkConnectivity();
+                                      _webViewController?.reload();
+                                    },
+                                    icon: const Icon(Icons.refresh_rounded),
+                                    label: const Text('إعادة المحاولة'),
+                                  ),
                                 ],
                               ),
                             ),
                           ),
+
+                        // ── Error Screen ──
+                        if (_hasError && !_isOffline)
+                          Container(
+                            color: Colors.white,
+                            child: Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(Icons.error_outline_rounded, size: 72, color: Color(0xFFFF7043)),
+                                  const SizedBox(height: 16),
+                                  const Text(
+                                    'تعذر تحميل الصفحة',
+                                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                                  ),
+                                  const SizedBox(height: 24),
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      ElevatedButton.icon(
+                                        onPressed: () => _webViewController?.reload(),
+                                        icon: const Icon(Icons.refresh_rounded),
+                                        label: const Text('إعادة التحميل'),
+                                      ),
+                                      const SizedBox(width: 12),
+                                      OutlinedButton.icon(
+                                        onPressed: () => _webViewController?.loadUrl(urlRequest: URLRequest(url: WebUri(kAppUrl))),
+                                        icon: const Icon(Icons.home_rounded),
+                                        label: const Text('الرئيسية'),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+
                       ],
                     ),
                   ),
@@ -205,18 +428,53 @@ jobs:
           APP_SLUG=${{ env.APP_SLUG }}
           APP_NAME="${{ github.event.inputs.app_name }}"
           APP_URL="${{ github.event.inputs.app_url }}"
-          
-          sed -i "s|title: 'Titan App'|title: '$APP_NAME'|" "$APP_SLUG/lib/main.dart"
-          sed -i "s|const String.fromEnvironment('APP_URL', defaultValue: 'https://google.com')|'$APP_URL'|" "$APP_SLUG/lib/main.dart"
+
+          # استبدال الـ placeholders بالقيم الحقيقية
+          sed -i "s|PLACEHOLDER_URL|$APP_URL|g" "$APP_SLUG/lib/main.dart"
+          sed -i "s|PLACEHOLDER_NAME|$APP_NAME|g" "$APP_SLUG/lib/main.dart"
+
+      - name: Handle App Icon
+        run: |
+          APP_SLUG=${{ env.APP_SLUG }}
+          ICON_URL="${{ github.event.inputs.icon_url }}"
+
+          if [ -n "$ICON_URL" ] && [ "$ICON_URL" != "" ]; then
+            echo "Downloading icon from: $ICON_URL"
+            curl -L -o /tmp/app_icon.png "$ICON_URL" 2>/dev/null || true
+
+            if [ -f /tmp/app_icon.png ] && [ -s /tmp/app_icon.png ]; then
+              sudo apt-get install -y imagemagick 2>/dev/null | tail -1
+
+              # Generate all required icon sizes
+              for size in 48 72 96 144 192; do
+                case $size in
+                  48)  dir="mipmap-mdpi"    ;;
+                  72)  dir="mipmap-hdpi"    ;;
+                  96)  dir="mipmap-xhdpi"   ;;
+                  144) dir="mipmap-xxhdpi"  ;;
+                  192) dir="mipmap-xxxhdpi" ;;
+                esac
+                mkdir -p "$APP_SLUG/android/app/src/main/res/$dir"
+                convert /tmp/app_icon.png -resize ${size}x${size} \
+                  "$APP_SLUG/android/app/src/main/res/$dir/ic_launcher.png" 2>/dev/null || true
+              done
+              echo "✅ Icon applied successfully"
+            else
+              echo "⚠️ Icon download failed, using default"
+            fi
+          else
+            echo "ℹ️ No icon URL provided, using default Flutter icon"
+          fi
 
       - name: Patch ProGuard Error
         run: |
-          find ~/.pub-cache/hosted/pub.dev/ -name "build.gradle" | xargs sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" || true
+          find ~/.pub-cache/hosted/pub.dev/ -name "build.gradle" \
+            | xargs sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" 2>/dev/null || true
 
       - name: Build APK
         run: |
           cd "${{ env.APP_SLUG }}"
-          flutter build apk --release
+          flutter build apk --release --no-shrink
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
