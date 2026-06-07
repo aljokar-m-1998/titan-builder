@@ -1,18 +1,23 @@
-name: Titan WebView Builder
+name: Titan WebView Builder Pro
 
 on:
   workflow_dispatch:
     inputs:
       app_url:
+        description: 'URL of the app'
         required: true
       app_name:
+        description: 'Name of the app'
         required: true
       icon_url:
+        description: 'Icon URL (Optional)'
         required: false
         default: ''
       tracking_id:
+        description: 'Tracking ID'
         required: true
       webhook_url:
+        description: 'Webhook URL'
         required: true
 
 jobs:
@@ -46,32 +51,35 @@ jobs:
             "$APP_SLUG"
 
           cd "$APP_SLUG"
-          flutter pub add webview_flutter
+          flutter pub add webview_flutter connectivity_plus permission_handler url_launcher
 
-      - name: Inject URL and app name
+      - name: Inject Permissions and App Name
+        run: |
+          APP_SLUG=${{ env.APP_SLUG }}
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          
+          MANIFEST="$APP_SLUG/android/app/src/main/AndroidManifest.xml"
+
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <application|' "$MANIFEST"
+
+          sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MANIFEST"
+          sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_NAME\"/" "$MANIFEST"
+
+      - name: Inject Professional main.dart
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
           APP_NAME="${{ github.event.inputs.app_name }}"
           APP_URL="${{ github.event.inputs.app_url }}"
 
-          # 1. إضافة Internet Permission
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' \
-            "$APP_SLUG/android/app/src/main/AndroidManifest.xml"
-
-          # 2. تفعيل usesCleartextTraffic + اسم التطبيق
-          sed -i 's|<application|<application android:usesCleartextTraffic="true"|' \
-            "$APP_SLUG/android/app/src/main/AndroidManifest.xml"
-
-          sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_NAME\"/" \
-            "$APP_SLUG/android/app/src/main/AndroidManifest.xml"
-
-          # 3. كتابة main.dart
           cat > "$APP_SLUG/lib/main.dart" << DART
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
           import 'package:webview_flutter/webview_flutter.dart';
+          import 'package:connectivity_plus/connectivity_plus.dart';
+          import 'package:permission_handler/permission_handler.dart';
+          import 'package:url_launcher/url_launcher.dart';
 
-          void main() {
+          void main() async {
             WidgetsFlutterBinding.ensureInitialized();
             SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
             runApp(const MyApp());
@@ -84,6 +92,7 @@ jobs:
               return MaterialApp(
                 title: '$APP_NAME',
                 debugShowCheckedModeBanner: false,
+                theme: ThemeData(useMaterial3: true),
                 home: const WebViewPage(),
               );
             }
@@ -97,24 +106,89 @@ jobs:
 
           class _WebViewPageState extends State<WebViewPage> {
             late final WebViewController _controller;
+            bool _isLoading = true;
+            bool _isOffline = false;
 
             @override
             void initState() {
               super.initState();
+              _checkPermissions();
+              _initWebView();
+              _checkConnectivity();
+            }
+
+            void _checkPermissions() async {
+              await [Permission.camera, Permission.microphone, Permission.storage].request();
+            }
+
+            void _checkConnectivity() async {
+              var connectivityResult = await (Connectivity().checkConnectivity());
+              setState(() {
+                // تم التعديل هنا ليتوافق مع الإصدارات الحديثة من حزمة connectivity_plus
+                _isOffline = connectivityResult.contains(ConnectivityResult.none);
+              });
+            }
+
+            void _initWebView() {
               _controller = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
                 ..setNavigationDelegate(NavigationDelegate(
-                  onWebResourceError: (error) =>
-                      debugPrint('WebView error: \${error.description}'),
+                  onPageStarted: (url) {
+                    setState(() => _isLoading = true);
+                  },
+                  onPageFinished: (url) {
+                    setState(() => _isLoading = false);
+                  },
+                  onWebResourceError: (error) {
+                    debugPrint('WebView error: \${error.description}');
+                  },
+                  onNavigationRequest: (NavigationRequest request) async {
+                    if (!request.url.startsWith('https://') && !request.url.startsWith('http://')) {
+                      if (await canLaunchUrl(Uri.parse(request.url))) {
+                        await launchUrl(Uri.parse(request.url), mode: LaunchMode.externalApplication);
+                        return NavigationDecision.prevent;
+                      }
+                    }
+                    return NavigationDecision.navigate;
+                  },
                 ))
                 ..loadRequest(Uri.parse('$APP_URL'));
             }
 
             @override
             Widget build(BuildContext context) {
-              return Scaffold(
-                body: SafeArea(
-                  child: WebViewWidget(controller: _controller),
+              return PopScope(
+                canPop: false,
+                onPopInvoked: (didPop) async {
+                  if (await _controller.canGoBack()) {
+                    await _controller.goBack();
+                  } else {
+                    SystemNavigator.pop();
+                  }
+                },
+                child: Scaffold(
+                  body: SafeArea(
+                    child: Stack(
+                      children: [
+                        WebViewWidget(controller: _controller),
+                        if (_isLoading) 
+                          const Center(child: CircularProgressIndicator(color: Colors.blue)),
+                        if (_isOffline)
+                          Container(
+                            color: Colors.white.withOpacity(0.8),
+                            child: const Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.wifi_off, size: 64, color: Colors.red),
+                                  Text("لا يوجد اتصال بالإنترنت", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                                ],
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
                 ),
               );
             }
