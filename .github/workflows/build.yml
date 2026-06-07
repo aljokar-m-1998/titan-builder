@@ -51,7 +51,7 @@ jobs:
             "$APP_SLUG"
 
           cd "$APP_SLUG"
-          flutter pub add webview_flutter connectivity_plus permission_handler url_launcher
+          flutter pub add flutter_inappwebview connectivity_plus permission_handler url_launcher
 
       - name: Inject Permissions and App Name
         run: |
@@ -71,10 +71,10 @@ jobs:
           APP_NAME="${{ github.event.inputs.app_name }}"
           APP_URL="${{ github.event.inputs.app_url }}"
 
-          cat > "$APP_SLUG/lib/main.dart" << DART
+          cat > "$APP_SLUG/lib/main.dart" << 'DART'
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
-          import 'package:webview_flutter/webview_flutter.dart';
+          import 'package:flutter_inappwebview/flutter_inappwebview.dart';
           import 'package:connectivity_plus/connectivity_plus.dart';
           import 'package:permission_handler/permission_handler.dart';
           import 'package:url_launcher/url_launcher.dart';
@@ -90,7 +90,7 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: '$APP_NAME',
+                title: 'Titan App',
                 debugShowCheckedModeBanner: false,
                 theme: ThemeData(useMaterial3: true),
                 home: const WebViewPage(),
@@ -105,7 +105,7 @@ jobs:
           }
 
           class _WebViewPageState extends State<WebViewPage> {
-            late final WebViewController _controller;
+            InAppWebViewController? _webViewController;
             bool _isLoading = true;
             bool _isOffline = false;
 
@@ -113,7 +113,6 @@ jobs:
             void initState() {
               super.initState();
               _checkPermissions();
-              _initWebView();
               _checkConnectivity();
             }
 
@@ -124,54 +123,18 @@ jobs:
             void _checkConnectivity() async {
               var connectivityResult = await (Connectivity().checkConnectivity());
               setState(() {
-                // إصلاح خطأ الـ connectivity_plus للإصدارات الحديثة
                 _isOffline = connectivityResult.contains(ConnectivityResult.none);
               });
-            }
-
-            void _initWebView() {
-              _controller = WebViewController()
-                ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                // استخدام UserAgent لمتصفح كمبيوتر لتخطي حظر جوجل لتسجيل الدخول في WebView
-                ..setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-                ..setNavigationDelegate(NavigationDelegate(
-                  onPageStarted: (url) {
-                    setState(() => _isLoading = true);
-                  },
-                  onPageFinished: (url) {
-                    setState(() => _isLoading = false);
-                  },
-                  onWebResourceError: (error) {
-                    setState(() => _isLoading = false); // إخفاء مؤشر التحميل عند الخطأ
-                    debugPrint('WebView error: \${error.description}');
-                  },
-                  onNavigationRequest: (NavigationRequest request) async {
-                    // السماح لجميع روابط جوجل وفايربيز بالعمل داخل الـ WebView لضمان حفظ الجلسة
-                    if (request.url.contains('accounts.google.com') || request.url.contains('firebaseapp.com')) {
-                      return NavigationDecision.navigate;
-                    }
-                    
-                    if (!request.url.startsWith('https://') && !request.url.startsWith('http://')) {
-                      if (await canLaunchUrl(Uri.parse(request.url))) {
-                        await launchUrl(Uri.parse(request.url), mode: LaunchMode.externalApplication);
-                        return NavigationDecision.prevent;
-                      }
-                    }
-                    return NavigationDecision.navigate;
-                  },
-                ))
-                ..loadRequest(Uri.parse('$APP_URL'));
             }
 
             @override
             Widget build(BuildContext context) {
               return PopScope(
                 canPop: false,
-                // استخدام onPopInvokedWithResult بدلاً من onPopInvoked لتجنب الـ Warnings
                 onPopInvokedWithResult: (didPop, result) async {
                   if (didPop) return;
-                  if (await _controller.canGoBack()) {
-                    await _controller.goBack();
+                  if (_webViewController != null && await _webViewController!.canGoBack()) {
+                    await _webViewController!.goBack();
                   } else {
                     SystemNavigator.pop();
                   }
@@ -180,14 +143,44 @@ jobs:
                   body: SafeArea(
                     child: Stack(
                       children: [
-                        WebViewWidget(controller: _controller),
+                        InAppWebView(
+                          // سيتم استبدال الرابط أدناه بالرابط الذي يمرره الـ Github Actions
+                          initialUrlRequest: URLRequest(url: WebUri(const String.fromEnvironment('APP_URL', defaultValue: 'https://google.com'))),
+                          initialSettings: InAppWebViewSettings(
+                            javaScriptEnabled: true,
+                            useShouldOverrideUrlLoading: true,
+                            useOnDownloadStart: true,
+                            userAgent: "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+                            supportZoom: true,
+                            allowFileAccessFromFileURLs: true,
+                            allowUniversalAccessFromFileURLs: true,
+                          ),
+                          onWebViewCreated: (controller) {
+                            _webViewController = controller;
+                          },
+                          onLoadStart: (controller, url) {
+                            setState(() => _isLoading = true);
+                          },
+                          onLoadStop: (controller, url) {
+                            setState(() => _isLoading = false);
+                          },
+                          shouldOverrideUrlLoading: (controller, navigationAction) async {
+                            var uri = navigationAction.request.url;
+                            if (uri != null && (!uri.scheme.startsWith('http') && !uri.scheme.startsWith('https'))) {
+                              if (await canLaunchUrl(uri)) {
+                                await launchUrl(uri, mode: LaunchMode.externalApplication);
+                                return NavigationActionPolicy.CANCEL;
+                              }
+                            }
+                            return NavigationActionPolicy.ALLOW;
+                          },
+                        ),
                         if (_isLoading) 
                           const Center(child: CircularProgressIndicator(color: Colors.blue)),
                         if (_isOffline)
                           Container(
                             color: Colors.white.withOpacity(0.8),
                             child: const Center(
-                              // تم إكمال الكود المقطوع هنا
                               child: Column(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
@@ -205,6 +198,15 @@ jobs:
             }
           }
           DART
+
+      - name: Replace Template Variables
+        run: |
+          APP_SLUG=${{ env.APP_SLUG }}
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          APP_URL="${{ github.event.inputs.app_url }}"
+          
+          sed -i "s|title: 'Titan App'|title: '$APP_NAME'|" "$APP_SLUG/lib/main.dart"
+          sed -i "s|const String.fromEnvironment('APP_URL', defaultValue: 'https://google.com')|'$APP_URL'|" "$APP_SLUG/lib/main.dart"
 
       - name: Build APK
         run: |
