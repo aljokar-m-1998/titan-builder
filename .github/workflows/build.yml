@@ -64,16 +64,16 @@ jobs:
           APP_NAME="${{ github.event.inputs.app_name }}"
           MANIFEST="$APP_SLUG/android/app/src/main/AndroidManifest.xml"
 
-          # Permissions
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.DOWNLOAD_WITHOUT_NOTIFICATION"/>\n    <application|' "$MANIFEST"
+          # Permissions (تم إضافة صلاحية الإشعارات الخاصة بأندرويد 13+)
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.DOWNLOAD_WITHOUT_NOTIFICATION"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <application|' "$MANIFEST"
 
-          # Allow cleartext + enable hardware acceleration (needed for WebView)
+          # Allow cleartext + enable hardware acceleration
           sed -i 's|<application|<application android:usesCleartextTraffic="true" android:hardwareAccelerated="true"|' "$MANIFEST"
 
           # App name
           sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_NAME\"/" "$MANIFEST"
 
-          # Enable file provider for downloads (inside <application> tag)
+          # Enable file provider for downloads
           sed -i 's|</application>|    <provider\n            android:name="androidx.core.content.FileProvider"\n            android:authorities="${applicationId}.fileprovider"\n            android:exported="false"\n            android:grantUriPermissions="true">\n            <meta-data\n                android:name="android.support.FILE_PROVIDER_PATHS"\n                android:resource="@xml/file_paths"/>\n        </provider>\n    </application>|' "$MANIFEST"
 
           # Create file_paths.xml for FileProvider
@@ -162,10 +162,12 @@ jobs:
             }
 
             void _requestPermissions() async {
+              // إضافة طلب صلاحية الإشعارات هنا
               await [
                 Permission.camera,
                 Permission.microphone,
                 Permission.storage,
+                Permission.notification, 
               ].request();
             }
 
@@ -181,7 +183,6 @@ jobs:
                 if (mounted) {
                   final wasOffline = _isOffline;
                   setState(() => _isOffline = results.contains(ConnectivityResult.none));
-                  // إذا رجع الإنترنت وكان في خطأ، نعيد التحميل
                   if (wasOffline && !_isOffline && _hasError) {
                     _webViewController?.reload();
                   }
@@ -206,24 +207,15 @@ jobs:
                   body: SafeArea(
                     child: Stack(
                       children: [
-
-                        // ── WebView ──
                         InAppWebView(
                           initialUrlRequest: URLRequest(url: WebUri(kAppUrl)),
                           initialSettings: InAppWebViewSettings(
-                            // JavaScript
                             javaScriptEnabled: true,
                             javaScriptCanOpenWindowsAutomatically: true,
-
-                            // Cookies & Sessions (مهم لتسجيل الدخول)
                             thirdPartyCookiesEnabled: true,
                             allowFileAccessFromFileURLs: true,
                             allowUniversalAccessFromFileURLs: true,
-
-                            // User Agent يحاكي Chrome على أندرويد
                             userAgent: "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
-
-                            // إعدادات متقدمة
                             useShouldOverrideUrlLoading: true,
                             useOnDownloadStart: true,
                             useOnLoadResource: false,
@@ -233,28 +225,16 @@ jobs:
                             domStorageEnabled: true,
                             databaseEnabled: true,
                             applicationNameForUserAgent: kAppName,
-
-                            // دعم الـ popup windows (مهم لـ OAuth)
-                            supportMultipleWindows: true,
-
-                            // منع cache الخاطئ
+                            supportMultipleWindows: true, // مهم جداً لتسجيل الدخول
                             cacheEnabled: true,
                             clearCache: false,
-
-                            // Mixed content (HTTP في HTTPS)
                             mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
-
-                            // Geolocation
                             geolocationEnabled: true,
-
-                            // Media autoplay
                             mediaPlaybackRequiresUserGesture: false,
                           ),
-
                           onWebViewCreated: (controller) {
                             _webViewController = controller;
                           },
-
                           onLoadStart: (controller, url) {
                             if (mounted) setState(() {
                               _isLoading = true;
@@ -262,16 +242,12 @@ jobs:
                               _currentUrl = url?.toString() ?? kAppUrl;
                             });
                           },
-
                           onLoadStop: (controller, url) async {
                             if (mounted) setState(() => _isLoading = false);
-                            // حفظ الـ URL الحالي لاستعادته عند الرجوع
                             final prefs = await SharedPreferences.getInstance();
                             await prefs.setString('lastUrl', url?.toString() ?? kAppUrl);
                           },
-
                           onReceivedError: (controller, request, error) {
-                            // تجاهل أخطاء الموارد الثانوية (صور، خطوط...)
                             if (request.isForMainFrame == true) {
                               if (mounted) setState(() {
                                 _isLoading = false;
@@ -279,14 +255,12 @@ jobs:
                               });
                             }
                           },
-
                           onPermissionRequest: (controller, request) async {
                             return PermissionResponse(
                               resources: request.resources,
                               action: PermissionResponseAction.GRANT,
                             );
                           },
-
                           onGeolocationPermissionsShowPrompt: (controller, origin) async {
                             return GeolocationPermissionShowPromptResponse(
                               origin: origin,
@@ -294,20 +268,15 @@ jobs:
                               retain: true,
                             );
                           },
-
-                          // معالجة الـ URL loading — مهم لتسجيل الدخول والـ OAuth
                           shouldOverrideUrlLoading: (controller, navigationAction) async {
                             final uri = navigationAction.request.url;
                             if (uri == null) return NavigationActionPolicy.ALLOW;
 
                             final scheme = uri.scheme.toLowerCase();
-
-                            // السماح لـ HTTP و HTTPS دائماً
                             if (scheme == 'http' || scheme == 'https') {
                               return NavigationActionPolicy.ALLOW;
                             }
 
-                            // فتح الـ deep links والـ custom schemes خارجياً
                             if (await canLaunchUrl(uri)) {
                               await launchUrl(uri, mode: LaunchMode.externalApplication);
                               return NavigationActionPolicy.CANCEL;
@@ -315,20 +284,51 @@ jobs:
 
                             return NavigationActionPolicy.ALLOW;
                           },
-
-                          // دعم الـ popup windows (OAuth, Social Login)
+                          
+                          // -- التعديل الجذري لحل مشكلة الشاشة البيضاء في النوافذ المنبثقة --
                           onCreateWindow: (controller, createWindowAction) async {
-                            final windowUrl = createWindowAction.request.url;
-                            if (windowUrl != null) {
-                              // فتح الـ popup في نفس الـ WebView
-                              await controller.loadUrl(
-                                urlRequest: URLRequest(url: windowUrl),
-                              );
-                            }
+                            showDialog(
+                              context: context,
+                              builder: (context) {
+                                return AlertDialog(
+                                  contentPadding: EdgeInsets.zero,
+                                  content: SizedBox(
+                                    width: MediaQuery.of(context).size.width,
+                                    height: MediaQuery.of(context).size.height * 0.8,
+                                    child: Column(
+                                      children: [
+                                        Align(
+                                          alignment: Alignment.topRight,
+                                          child: IconButton(
+                                            icon: const Icon(Icons.close),
+                                            onPressed: () => Navigator.pop(context),
+                                          ),
+                                        ),
+                                        Expanded(
+                                          child: InAppWebView(
+                                            windowId: createWindowAction.windowId,
+                                            initialSettings: InAppWebViewSettings(
+                                              javaScriptEnabled: true,
+                                              thirdPartyCookiesEnabled: true,
+                                              userAgent: "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+                                            ),
+                                            onCloseWindow: (controller) async {
+                                              if (Navigator.canPop(context)) {
+                                                Navigator.pop(context);
+                                              }
+                                            },
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              },
+                            );
                             return true;
                           },
+                          // -------------------------------------------------------------
 
-                          // تحميل الملفات
                           onDownloadStartRequest: (controller, downloadStartRequest) async {
                             final url = downloadStartRequest.url.toString();
                             if (await canLaunchUrl(Uri.parse(url))) {
@@ -413,7 +413,6 @@ jobs:
                               ),
                             ),
                           ),
-
                       ],
                     ),
                   ),
