@@ -32,7 +32,6 @@ jobs:
 
       - name: Create Flutter WebView project
         run: |
-          # Sanitize: lowercase + underscores only
           APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" \
             | tr '[:upper:]' '[:lower:]' \
             | sed 's/[^a-z0-9]/_/g' \
@@ -55,11 +54,18 @@ jobs:
           APP_NAME="${{ github.event.inputs.app_name }}"
           APP_URL="${{ github.event.inputs.app_url }}"
 
-          # 1. اسم التطبيق في AndroidManifest
+          # 1. إضافة Internet Permission
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' \
+            "$APP_SLUG/android/app/src/main/AndroidManifest.xml"
+
+          # 2. تفعيل usesCleartextTraffic + اسم التطبيق
+          sed -i 's|<application|<application android:usesCleartextTraffic="true"|' \
+            "$APP_SLUG/android/app/src/main/AndroidManifest.xml"
+
           sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_NAME\"/" \
             "$APP_SLUG/android/app/src/main/AndroidManifest.xml"
 
-          # 2. كود main.dart بالـ URL الصح
+          # 3. كتابة main.dart
           cat > "$APP_SLUG/lib/main.dart" << DART
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
@@ -98,7 +104,8 @@ jobs:
               _controller = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
                 ..setNavigationDelegate(NavigationDelegate(
-                  onWebResourceError: (error) => debugPrint('WebView error: \${error.description}'),
+                  onWebResourceError: (error) =>
+                      debugPrint('WebView error: \${error.description}'),
                 ))
                 ..loadRequest(Uri.parse('$APP_URL'));
             }
