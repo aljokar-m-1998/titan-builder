@@ -123,6 +123,7 @@ jobs:
             void _checkConnectivity() async {
               var connectivityResult = await (Connectivity().checkConnectivity());
               setState(() {
+                // استخدام الطريقة الحديثة لتوافق الإصدارات الجديدة من المكتبة
                 _isOffline = connectivityResult.contains(ConnectivityResult.none);
               });
             }
@@ -144,7 +145,7 @@ jobs:
                     child: Stack(
                       children: [
                         InAppWebView(
-                          // سيتم استبدال الرابط أدناه بالرابط الذي يمرره الـ Github Actions
+                          // استخدام متغير ليتم استبداله بأمان لاحقاً لتجنب تعارض رموز الرابط في الـ Bash
                           initialUrlRequest: URLRequest(url: WebUri(const String.fromEnvironment('APP_URL', defaultValue: 'https://google.com'))),
                           initialSettings: InAppWebViewSettings(
                             javaScriptEnabled: true,
@@ -207,6 +208,10 @@ jobs:
           
           sed -i "s|title: 'Titan App'|title: '$APP_NAME'|" "$APP_SLUG/lib/main.dart"
           sed -i "s|const String.fromEnvironment('APP_URL', defaultValue: 'https://google.com')|'$APP_URL'|" "$APP_SLUG/lib/main.dart"
+
+      - name: Patch ProGuard Error
+        run: |
+          find ~/.pub-cache/hosted/pub.dev/ -name "build.gradle" | xargs sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" || true
 
       - name: Build APK
         run: |
