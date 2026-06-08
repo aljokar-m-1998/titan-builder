@@ -81,7 +81,8 @@ jobs:
             url_launcher \
             shared_preferences \
             path_provider \
-            dio
+            dio \
+            device_info_plus
 
       # ── Step 2: AndroidManifest ───────────────────────────────────────────────
       - name: Inject Permissions and Manifest Settings
@@ -151,6 +152,7 @@ jobs:
           import 'package:shared_preferences/shared_preferences.dart';
           import 'package:path_provider/path_provider.dart';
           import 'package:dio/dio.dart';
+          import 'package:device_info_plus/device_info_plus.dart';
 
           const String kAppUrl  = 'PLACEHOLDER_URL';
           const String kAppName = 'PLACEHOLDER_NAME';
@@ -158,7 +160,7 @@ jobs:
           const bool   kEnableNotifications = PLACEHOLDER_NOTIFICATIONS;
           const bool   kEnableCamera        = PLACEHOLDER_CAMERA;
           const bool   kEnableStorage       = PLACEHOLDER_STORAGE;
-          
+
           // Chrome 124 Android — أحدث User-Agent مموه
           const String kUserAgent =
             'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro Build/UQ1A.240105.004) '
@@ -198,9 +200,9 @@ jobs:
 
           class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
             InAppWebViewController? _ctrl;
-            bool _loading  = true;
-            bool _offline  = false;
-            bool _error    = false;
+            bool _loading    = true;
+            bool _offline    = false;
+            bool _error      = false;
             bool _fullscreen = false;
 
             @override
@@ -223,9 +225,60 @@ jobs:
               super.dispose();
             }
 
+            // ── طلب الأذونات — مقسّمة حسب النوع والإصدار ──────────────────────
             Future<void> _requestPermissions() async {
-              final perms = <Permission>[if (kEnableCamera) Permission.camera, if (kEnableCamera) Permission.microphone, if (kEnableStorage) Permission.storage, if (kEnableNotifications) Permission.notification, if (kEnableLocation) Permission.locationWhenInUse];
-              if (perms.isNotEmpty) await perms.request();
+              // ① كاميرا + مايك
+              if (kEnableCamera) {
+                await [Permission.camera, Permission.microphone].request();
+              }
+
+              // ② موقع
+              if (kEnableLocation) {
+                await Permission.locationWhenInUse.request();
+              }
+
+              // ③ تخزين — مقسّم حسب إصدار أندرويد
+              if (kEnableStorage && Platform.isAndroid) {
+                final sdkInt = await _getSdkInt();
+                if (sdkInt <= 29) {
+                  // أندرويد 9 وما دون — يحتاج WRITE_EXTERNAL_STORAGE
+                  await Permission.storage.request();
+                } else if (sdkInt <= 32) {
+                  // أندرويد 10-12 — READ_EXTERNAL_STORAGE فقط
+                  await Permission.storage.request();
+                } else {
+                  // أندرويد 13+ — READ_MEDIA_* بدلاً من storage
+                  await [
+                    Permission.photos,
+                    Permission.videos,
+                    Permission.audio,
+                  ].request();
+                }
+              }
+
+              // ④ إشعارات — Android 13+ (API 33+) يستلزم POST_NOTIFICATIONS
+              if (kEnableNotifications && Platform.isAndroid) {
+                final sdkInt = await _getSdkInt();
+                if (sdkInt >= 33) {
+                  final status = await Permission.notification.status;
+                  if (status.isDenied) {
+                    await Permission.notification.request();
+                  } else if (status.isPermanentlyDenied) {
+                    await openAppSettings();
+                  }
+                }
+                // أقل من API 33 — الإشعارات مسموحة تلقائياً بدون طلب
+              }
+            }
+
+            // قراءة SDK version — نعيد 33 كـ safe fallback للأجهزة الحديثة
+            Future<int> _getSdkInt() async {
+              try {
+                final info = await DeviceInfoPlugin().androidInfo;
+                return info.version.sdkInt;
+              } catch (_) {
+                return 33; // fallback آمن
+              }
             }
 
             Future<void> _checkConnectivity() async {
@@ -233,7 +286,7 @@ jobs:
               if (mounted) setState(() => _offline = r.contains(ConnectivityResult.none));
             }
 
-            // ── Fullscreen helpers ──
+            // ── Fullscreen helpers ─────────────────────────────────────────────
             void _enterFullscreen() {
               setState(() => _fullscreen = true);
               SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
@@ -246,28 +299,80 @@ jobs:
               SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
             }
 
-            // ── Download handler ──
+            // ── Download handler — يحفظ في /storage/emulated/0/Download ────────
             Future<void> _handleDownload(String url, String? suggestedFilename, String? mimeType) async {
               try {
-                final dir  = await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory();
-                final name = suggestedFilename ?? url.split('/').last.split('?').first;
-                final path = '${dir.path}/$name';
-                final dio  = Dio();
+                // ① طلب إذن التخزين على أندرويد 9 وما دون
+                if (Platform.isAndroid) {
+                  final sdkInt = await _getSdkInt();
+                  if (sdkInt <= 29) {
+                    final status = await Permission.storage.status;
+                    if (!status.isGranted) {
+                      final result = await Permission.storage.request();
+                      if (!result.isGranted) {
+                        // لا يوجد إذن — fallback: افتح في المتصفح
+                        final uri = Uri.parse(url);
+                        if (await canLaunchUrl(uri)) await launchUrl(uri, mode: LaunchMode.externalApplication);
+                        return;
+                      }
+                    }
+                  }
+                }
 
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('جاري تحميل $name...'), duration: const Duration(seconds: 2)));
+                // ② اسم الملف
+                final name = (suggestedFilename != null && suggestedFilename.isNotEmpty)
+                    ? suggestedFilename
+                    : url.split('/').last.split('?').first;
 
-                await dio.download(url, path, onReceiveProgress: (r, t) {});
+                // ③ مسار التنزيلات العام — مرئي في تطبيق الملفات
+                final String savePath;
+                if (Platform.isAndroid) {
+                  savePath = '/storage/emulated/0/Download/$name';
+                } else {
+                  final dir = await getApplicationDocumentsDirectory();
+                  savePath = '${dir.path}/$name';
+                }
 
+                // ④ إشعار البداية
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('جاري تحميل $name...'), duration: const Duration(seconds: 2)),
+                  );
+                }
+
+                // ⑤ تنفيذ التحميل
+                final dio = Dio();
+                await dio.download(
+                  url,
+                  savePath,
+                  onReceiveProgress: (r, t) {},
+                  options: Options(
+                    headers: {'User-Agent': kUserAgent},
+                    receiveTimeout: const Duration(minutes: 10),
+                  ),
+                );
+
+                // ⑥ إشعار النجاح
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text('✅ تم تحميل $name'),
-                    action: SnackBarAction(label: 'فتح', onPressed: () => launchUrl(Uri.file(path), mode: LaunchMode.externalApplication)),
+                    content: Text('✅ تم الحفظ في التنزيلات: $name'),
+                    duration: const Duration(seconds: 4),
+                    action: SnackBarAction(
+                      label: 'فتح',
+                      onPressed: () => launchUrl(Uri.file(savePath), mode: LaunchMode.externalApplication),
+                    ),
                   ));
                 }
               } catch (e) {
-                // fallback: open in browser
+                // fallback: افتح في المتصفح الخارجي
                 final uri = Uri.parse(url);
-                if (await canLaunchUrl(uri)) await launchUrl(uri, mode: LaunchMode.externalApplication);
+                if (await canLaunchUrl(uri)) {
+                  await launchUrl(uri, mode: LaunchMode.externalApplication);
+                } else if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('❌ فشل التحميل')),
+                  );
+                }
               }
             }
 
