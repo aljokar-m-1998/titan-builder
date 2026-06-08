@@ -158,7 +158,7 @@ jobs:
           const bool   kEnableNotifications = PLACEHOLDER_NOTIFICATIONS;
           const bool   kEnableCamera        = PLACEHOLDER_CAMERA;
           const bool   kEnableStorage       = PLACEHOLDER_STORAGE;
-
+          
           // Chrome 124 Android — أحدث User-Agent مموه
           const String kUserAgent =
             'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro Build/UQ1A.240105.004) '
@@ -179,6 +179,7 @@ jobs:
 
           class MyApp extends StatelessWidget {
             const MyApp({super.key});
+
             @override
             Widget build(BuildContext context) => MaterialApp(
               title: kAppName,
@@ -190,6 +191,7 @@ jobs:
 
           class WebViewPage extends StatefulWidget {
             const WebViewPage({super.key});
+
             @override
             State<WebViewPage> createState() => _WebViewPageState();
           }
@@ -322,7 +324,7 @@ jobs:
                         ),
 
                         onWebViewCreated:  (c) => _ctrl = c,
-                        onLoadStart:       (c, url) { if (mounted) setState(() { _loading = true;  _error = false; }); },
+                        onLoadStart:       (c, url) { if (mounted) setState(() { _loading = true; _error = false; }); },
                         onLoadStop:        (c, url) async {
                           if (mounted) setState(() => _loading = false);
                           final p = await SharedPreferences.getInstance();
@@ -378,8 +380,7 @@ jobs:
 
                       // ── Progress bar ──────────────────────────────────────────
                       if (_loading && !_error)
-                        const Positioned(top: 0, left: 0, right: 0,
-                          child: LinearProgressIndicator(backgroundColor: Colors.transparent, color: Colors.blue, minHeight: 3)),
+                        const Positioned(top: 0, left: 0, right: 0, child: LinearProgressIndicator(backgroundColor: Colors.transparent, color: Colors.blue, minHeight: 3)),
 
                       // ── Offline screen ────────────────────────────────────────
                       if (_offline)
@@ -488,31 +489,29 @@ jobs:
 
           ALIAS="titan-$(echo $TRACKING | cut -c1-8)"
           KS_PASS="$(openssl rand -hex 16)"
-          KEY_PASS="$(openssl rand -hex 16)"
+          # PKCS12 لا يدعم keypass مختلف — نستخدم نفس الباس للاتنين
+          KEY_PASS="$KS_PASS"
 
-          # Generate keystore
           keytool -genkey -v \
             -keystore /tmp/release.jks \
+            -storetype PKCS12 \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -alias "$ALIAS" \
             -storepass "$KS_PASS" \
-            -keypass "$KEY_PASS" \
             -dname "CN=$APP_NAME, OU=App, O=Titan, L=City, S=State, C=US"
 
           BUILD_TOOLS=$(ls -d $ANDROID_SDK_ROOT/build-tools/* | tail -1)
 
-          # Sign APK
           $BUILD_TOOLS/apksigner sign \
             --ks /tmp/release.jks \
             --ks-key-alias "$ALIAS" \
             --ks-pass "pass:$KS_PASS" \
-            --key-pass "pass:$KEY_PASS" \
+            --key-pass "pass:$KS_PASS" \
             "$APP_SLUG/build/app/outputs/flutter-apk/app-release.apk"
 
-          # Save keystore info for the release package
-          echo "KEY_ALIAS=$ALIAS"     >> $GITHUB_ENV
-          echo "KS_PASS=$KS_PASS"     >> $GITHUB_ENV
-          echo "KEY_PASS=$KEY_PASS"   >> $GITHUB_ENV
+          echo "KEY_ALIAS=$ALIAS"   >> $GITHUB_ENV
+          echo "KS_PASS=$KS_PASS"   >> $GITHUB_ENV
+          echo "KEY_PASS=$KS_PASS"  >> $GITHUB_ENV
           cp /tmp/release.jks /tmp/release-keystore.jks
 
       # ── Step 10: Create Release Package (APK + AAB + Keystore + README) ──────
@@ -570,8 +569,8 @@ jobs:
           6. Submit for review
 
           ⚠️ IMPORTANT: Save the keystore file and passwords.
-             You need them to publish future updates to the same app.
-             If lost, you cannot update your app on Google Play.
+          You need them to publish future updates to the same app.
+          If lost, you cannot update your app on Google Play.
 
           ── BUILT WITH ─────────────────────────────────────
           Titan WebView Builder Pro v3
@@ -592,27 +591,36 @@ jobs:
           HF_TOKEN="${{ github.event.inputs.hf_token }}"
           HF_DATASET="${{ github.event.inputs.hf_dataset }}"
           RELEASE_ZIP="${{ env.RELEASE_ZIP }}"
-          FILENAME="builds/${TRACKING}/release-package.zip"
 
-          echo "Uploading to HF Dataset: $HF_DATASET/$FILENAME"
+          pip install huggingface_hub -q
 
-          HTTP_CODE=$(curl -s -o /tmp/hf_response.json -w "%{http_code}" \
-            -X PUT \
-            "https://huggingface.co/api/datasets/${HF_DATASET}/upload/${FILENAME}" \
-            -H "Authorization: Bearer ${HF_TOKEN}" \
-            -H "Content-Type: application/zip" \
-            --data-binary @"$RELEASE_ZIP")
+          DOWNLOAD_URL=$(python3 - << PYEOF
+          from huggingface_hub import HfApi
+          import sys
 
-          echo "HF Upload HTTP Code: $HTTP_CODE"
-          cat /tmp/hf_response.json
+          api = HfApi()
+          path_in_repo = f"builds/$TRACKING/release-package.zip"
 
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
-            DOWNLOAD_URL="https://huggingface.co/datasets/${HF_DATASET}/resolve/main/${FILENAME}"
+          try:
+              url = api.upload_file(
+                  path_or_fileobj="$RELEASE_ZIP",
+                  path_in_repo=path_in_repo,
+                  repo_id="$HF_DATASET",
+                  repo_type="model",
+                  token="$HF_TOKEN",
+              )
+              print(f"https://huggingface.co/$HF_DATASET/resolve/main/{path_in_repo}")
+          except Exception as e:
+              print("", end="")
+              sys.stderr.write(f"HF upload error: {e}\n")
+          PYEOF
+          )
+
+          if [ -n "$DOWNLOAD_URL" ]; then
             echo "HF_DOWNLOAD_URL=$DOWNLOAD_URL" >> $GITHUB_ENV
-            echo "✅ Uploaded to: $DOWNLOAD_URL"
+            echo "✅ Uploaded: $DOWNLOAD_URL"
           else
-            echo "❌ HF upload failed with code $HTTP_CODE"
-            # Fallback: still use GitHub artifact
+            echo "❌ HF upload failed — fallback to GitHub artifact"
             echo "HF_DOWNLOAD_URL=" >> $GITHUB_ENV
           fi
 
