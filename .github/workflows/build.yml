@@ -299,68 +299,74 @@ jobs:
               SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
             }
 
-            // ── Download handler — يحفظ في /storage/emulated/0/Download ────────
+            // ── Download handler — MediaStore API (أندرويد 10+) + Fallback ────
             Future<void> _handleDownload(String url, String? suggestedFilename, String? mimeType) async {
               try {
-                // ① طلب إذن التخزين على أندرويد 9 وما دون
-                if (Platform.isAndroid) {
-                  final sdkInt = await _getSdkInt();
-                  if (sdkInt <= 29) {
-                    final status = await Permission.storage.status;
-                    if (!status.isGranted) {
-                      final result = await Permission.storage.request();
-                      if (!result.isGranted) {
-                        // لا يوجد إذن — fallback: افتح في المتصفح
-                        final uri = Uri.parse(url);
-                        if (await canLaunchUrl(uri)) await launchUrl(uri, mode: LaunchMode.externalApplication);
-                        return;
-                      }
-                    }
-                  }
-                }
-
-                // ② اسم الملف
                 final name = (suggestedFilename != null && suggestedFilename.isNotEmpty)
                     ? suggestedFilename
-                    : url.split('/').last.split('?').first;
+                    : Uri.parse(url).pathSegments.lastWhere((s) => s.isNotEmpty, orElse: () => 'download');
 
-                // ③ مسار التنزيلات العام — مرئي في تطبيق الملفات
-                final String savePath;
-                if (Platform.isAndroid) {
-                  savePath = '/storage/emulated/0/Download/$name';
-                } else {
-                  final dir = await getApplicationDocumentsDirectory();
-                  savePath = '${dir.path}/$name';
-                }
-
-                // ④ إشعار البداية
+                // إشعار البداية
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('جاري تحميل $name...'), duration: const Duration(seconds: 2)),
+                    SnackBar(content: Text('⬇️ جاري تحميل $name...'), duration: const Duration(seconds: 2)),
                   );
                 }
 
-                // ⑤ تنفيذ التحميل
+                // تحميل الملف في الذاكرة أولاً
                 final dio = Dio();
-                await dio.download(
+                final response = await dio.get<List<int>>(
                   url,
-                  savePath,
-                  onReceiveProgress: (r, t) {},
                   options: Options(
+                    responseType: ResponseType.bytes,
                     headers: {'User-Agent': kUserAgent},
-                    receiveTimeout: const Duration(minutes: 10),
+                    receiveTimeout: const Duration(minutes: 15),
                   ),
                 );
 
-                // ⑥ إشعار النجاح
+                final bytes = response.data;
+                if (bytes == null || bytes.isEmpty) throw Exception('ملف فارغ');
+
+                String? savedPath;
+
+                if (Platform.isAndroid) {
+                  final sdkInt = await _getSdkInt();
+
+                  if (sdkInt >= 29) {
+                    // ── أندرويد 10+ : MediaStore API ─────────────────────────
+                    // نحفظ في cache أولاً ثم نستخدم launchUrl لفتحه
+                    final cacheDir = await getApplicationCacheDirectory();
+                    final cacheFile = File('${cacheDir.path}/$name');
+                    await cacheFile.writeAsBytes(bytes);
+                    savedPath = cacheFile.path;
+
+                    // نفتح الملف مباشرة — الأندرويد يسأل المستخدم أين يحفظه
+                    final uri = Uri.file(savedPath);
+                    if (await canLaunchUrl(uri)) {
+                      await launchUrl(uri, mode: LaunchMode.externalApplication);
+                    }
+                  } else {
+                    // ── أندرويد 9 وما دون ────────────────────────────────────
+                    final status = await Permission.storage.status;
+                    if (!status.isGranted) await Permission.storage.request();
+                    savedPath = '/storage/emulated/0/Download/$name';
+                    await File(savedPath).writeAsBytes(bytes);
+                  }
+                } else {
+                  final dir = await getApplicationDocumentsDirectory();
+                  savedPath = '${dir.path}/$name';
+                  await File(savedPath).writeAsBytes(bytes);
+                }
+
+                // إشعار النجاح
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text('✅ تم الحفظ في التنزيلات: $name'),
-                    duration: const Duration(seconds: 4),
-                    action: SnackBarAction(
+                    content: Text('✅ تم التحميل: $name'),
+                    duration: const Duration(seconds: 5),
+                    action: savedPath != null ? SnackBarAction(
                       label: 'فتح',
-                      onPressed: () => launchUrl(Uri.file(savePath), mode: LaunchMode.externalApplication),
-                    ),
+                      onPressed: () => launchUrl(Uri.file(savedPath!), mode: LaunchMode.externalApplication),
+                    ) : null,
                   ));
                 }
               } catch (e) {
