@@ -82,7 +82,10 @@ jobs:
             shared_preferences \
             path_provider \
             dio \
-            device_info_plus
+            device_info_plus \
+            just_audio \
+            audio_service \
+            flutter_local_notifications
 
       # ── Step 2: AndroidManifest ───────────────────────────────────────────────
       - name: Inject Permissions and Manifest Settings
@@ -143,6 +146,7 @@ jobs:
 
           cat > "$APP_SLUG/lib/main.dart" << 'DART'
           import 'dart:io';
+          import 'dart:typed_data';
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
           import 'package:flutter_inappwebview/flutter_inappwebview.dart';
@@ -153,6 +157,9 @@ jobs:
           import 'package:path_provider/path_provider.dart';
           import 'package:dio/dio.dart';
           import 'package:device_info_plus/device_info_plus.dart';
+          import 'package:audio_service/audio_service.dart';
+          import 'package:just_audio/just_audio.dart';
+          import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
           const String kAppUrl  = 'PLACEHOLDER_URL';
           const String kAppName = 'PLACEHOLDER_NAME';
@@ -167,8 +174,63 @@ jobs:
             'AppleWebKit/537.36 (KHTML, like Gecko) '
             'Chrome/124.0.6367.82 Mobile Safari/537.36';
 
+          // ── Audio/Media Handler for lock screen & notification controls ──────
+          class TitanAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
+            @override
+            Future<void> play() async {
+              playbackState.add(playbackState.value.copyWith(playing: true));
+            }
+            @override
+            Future<void> pause() async {
+              playbackState.add(playbackState.value.copyWith(playing: false));
+            }
+            @override
+            Future<void> stop() async {
+              playbackState.add(playbackState.value.copyWith(
+                playing: false,
+                processingState: AudioProcessingState.idle,
+              ));
+            }
+            void updateMediaItem(String title, String artUrl) {
+              mediaItem.add(MediaItem(
+                id: 'webview_media',
+                title: title,
+                artUri: artUrl.isNotEmpty ? Uri.parse(artUrl) : null,
+                album: kAppName,
+              ));
+            }
+            void updatePlaybackState(bool playing) {
+              playbackState.add(playbackState.value.copyWith(
+                playing: playing,
+                controls: [
+                  MediaControl.skipToPrevious,
+                  playing ? MediaControl.pause : MediaControl.play,
+                  MediaControl.skipToNext,
+                ],
+                systemActions: {MediaAction.seek},
+                androidCompactActionIndices: [0, 1, 2],
+                processingState: AudioProcessingState.ready,
+              ));
+            }
+          }
+
+          late TitanAudioHandler _audioHandler;
+
           void main() async {
             WidgetsFlutterBinding.ensureInitialized();
+
+            // Initialize audio service for media notifications
+            _audioHandler = await AudioService.init(
+              builder: () => TitanAudioHandler(),
+              config: const AudioServiceConfig(
+                androidNotificationChannelId: 'com.titan.webview.media',
+                androidNotificationChannelName: 'Media Playback',
+                androidNotificationOngoing: true,
+                androidStopForegroundOnPause: true,
+                notificationColor: Color(0xFF1a1a2e),
+              ),
+            );
+
             SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
             SystemChrome.setPreferredOrientations([
               DeviceOrientation.portraitUp,
@@ -217,6 +279,32 @@ jobs:
                 setState(() => _offline = r.contains(ConnectivityResult.none));
                 if (wasOffline && !_offline && _error) _ctrl?.reload();
               });
+            }
+
+            void _setupMediaBridge(InAppWebViewController ctrl) {
+              ctrl.addJavaScriptHandler(
+                handlerName: 'titanMediaUpdate',
+                callback: (args) {
+                  if (args.isEmpty) return;
+                  try {
+                    final data    = args[0] as Map<String, dynamic>;
+                    final playing = data['playing'] as bool? ?? false;
+                    final title   = data['title']   as String? ?? kAppName;
+                    final artUrl  = data['artUrl']  as String? ?? '';
+                    _audioHandler.updateMediaItem(title, artUrl);
+                    _audioHandler.updatePlaybackState(playing);
+                  } catch (_) {}
+                },
+              );
+              const jsCode =  +
+              r"(function(){" +
+              r"function notify(el){if(!el)return;window.flutter_inappwebview.callHandler('titanMediaUpdate',{playing:!el.paused,title:document.title||'',artUrl:(function(){var og=document.querySelector('meta[property="og:image"]');return og?og.getAttribute('content'):'';})()});}" +
+              r"function attach(el){['play','pause','ended'].forEach(function(e){el.addEventListener(e,function(){notify(el);});});}" +
+              r"document.querySelectorAll('video,audio').forEach(attach);" +
+              r"new MutationObserver(function(ms){ms.forEach(function(m){m.addedNodes.forEach(function(n){if(n.tagName==='VIDEO'||n.tagName==='AUDIO')attach(n);});});}).observe(document.body,{childList:true,subtree:true});" +
+              r"})();" +
+              ;
+              ctrl.evaluateJavascript(source: jsCode);
             }
 
             @override
@@ -329,33 +417,39 @@ jobs:
 
                 String? savedPath;
 
+                // حفظ في مجلد مؤقت أولاً (يعمل على كل إصدارات الأندرويد)
+                final tempDir  = await getTemporaryDirectory();
+                final tempFile = File('${tempDir.path}/$name');
+                await tempFile.writeAsBytes(bytes);
+                savedPath = tempFile.path;
+
                 if (Platform.isAndroid) {
                   final sdkInt = await _getSdkInt();
 
                   if (sdkInt >= 29) {
-                    // ── أندرويد 10+ : MediaStore API ─────────────────────────
-                    // نحفظ في cache أولاً ثم نستخدم launchUrl لفتحه
-                    final cacheDir = await getApplicationCacheDirectory();
-                    final cacheFile = File('${cacheDir.path}/$name');
-                    await cacheFile.writeAsBytes(bytes);
-                    savedPath = cacheFile.path;
-
-                    // نفتح الملف مباشرة — الأندرويد يسأل المستخدم أين يحفظه
-                    final uri = Uri.file(savedPath);
-                    if (await canLaunchUrl(uri)) {
-                      await launchUrl(uri, mode: LaunchMode.externalApplication);
+                    // أندرويد 10+ — ننسخ للـ Downloads عبر content URI
+                    try {
+                      const platform = MethodChannel('titan_download');
+                      await platform.invokeMethod('saveToDownloads', {
+                        'sourcePath': savedPath,
+                        'fileName': name,
+                        'mimeType': mimeType ?? 'application/octet-stream',
+                      });
+                    } catch (_) {
+                      // fallback: افتح مباشرة
+                      final uri = Uri.file(savedPath);
+                      if (await canLaunchUrl(uri)) {
+                        await launchUrl(uri, mode: LaunchMode.externalApplication);
+                      }
                     }
                   } else {
-                    // ── أندرويد 9 وما دون ────────────────────────────────────
+                    // أندرويد 9 وما دون — كتابة مباشرة
                     final status = await Permission.storage.status;
                     if (!status.isGranted) await Permission.storage.request();
-                    savedPath = '/storage/emulated/0/Download/$name';
-                    await File(savedPath).writeAsBytes(bytes);
+                    final dlPath = '/storage/emulated/0/Download/$name';
+                    await File(dlPath).writeAsBytes(bytes);
+                    savedPath = dlPath;
                   }
-                } else {
-                  final dir = await getApplicationDocumentsDirectory();
-                  savedPath = '${dir.path}/$name';
-                  await File(savedPath).writeAsBytes(bytes);
                 }
 
                 // إشعار النجاح
@@ -440,6 +534,7 @@ jobs:
                           if (mounted) setState(() => _loading = false);
                           final p = await SharedPreferences.getInstance();
                           await p.setString('lastUrl', url?.toString() ?? kAppUrl);
+                          _setupMediaBridge(c);
                         },
                         onReceivedError:   (c, req, err) {
                           if (req.isForMainFrame == true && mounted) setState(() { _loading = false; _error = true; });
@@ -526,6 +621,80 @@ jobs:
             }
           }
           DART
+
+      # ── Step 3b: MainActivity for MediaStore Downloads ─────────────────────────
+      - name: Inject MainActivity Kotlin
+        run: |
+          APP_SLUG=${{ env.APP_SLUG }}
+          PKG_PATH="$APP_SLUG/android/app/src/main/kotlin/com/titan/$APP_SLUG"
+          mkdir -p "$PKG_PATH"
+
+          cat > "$PKG_PATH/MainActivity.kt" << 'KOTLIN'
+          package com.titan.APP_SLUG_PLACEHOLDER
+
+          import android.content.ContentValues
+          import android.os.Build
+          import android.os.Environment
+          import android.provider.MediaStore
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
+
+          class MainActivity : FlutterActivity() {
+            private val CHANNEL = "titan_download"
+
+            override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+              super.configureFlutterEngine(flutterEngine)
+              MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+                .setMethodCallHandler { call, result ->
+                  if (call.method == "saveToDownloads") {
+                    val sourcePath = call.argument<String>("sourcePath") ?: ""
+                    val fileName   = call.argument<String>("fileName")   ?: "download"
+                    val mimeType   = call.argument<String>("mimeType")   ?: "*/*"
+                    try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val values = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                          put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                          put(MediaStore.Downloads.IS_PENDING, 1)
+                        }
+                        val uri = contentResolver.insert(
+                          MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
+                        )
+                        if (uri != null) {
+                          contentResolver.openOutputStream(uri)?.use { out ->
+                            File(sourcePath).inputStream().copyTo(out)
+                          }
+                          values.clear()
+                          values.put(MediaStore.Downloads.IS_PENDING, 0)
+                          contentResolver.update(uri, values, null, null)
+                          result.success("saved")
+                        } else {
+                          result.error("FAILED", "Could not create MediaStore entry", null)
+                        }
+                      } else {
+                        val dest = File(
+                          Environment.getExternalStoragePublicDirectory(
+                            Environment.DIRECTORY_DOWNLOADS
+                          ), fileName
+                        )
+                        File(sourcePath).copyTo(dest, overwrite = true)
+                        result.success("saved")
+                      }
+                    } catch (e: Exception) {
+                      result.error("ERROR", e.message, null)
+                    }
+                  } else {
+                    result.notImplemented()
+                  }
+                }
+            }
+          }
+          KOTLIN
+
+          # Replace package placeholder
+          sed -i "s/APP_SLUG_PLACEHOLDER/$APP_SLUG/g" "$PKG_PATH/MainActivity.kt"
 
       # ── Step 4: Replace placeholders ─────────────────────────────────────────
       - name: Replace Template Variables
