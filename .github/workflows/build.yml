@@ -57,7 +57,7 @@ jobs:
         with:
           channel: 'stable'
 
-      # ── Step 1: Create Flutter project + Enable Desugaring ───────────────────
+      # ── Step 1: Create Flutter project ───────────────────────────────────────
       - name: Create Flutter WebView project
         run: |
           APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" \
@@ -87,11 +87,16 @@ jobs:
             audio_service \
             flutter_local_notifications
 
-          # ── Enable Core Library Desugaring (required by flutter_local_notifications) ──
-          GRADLE="android/app/build.gradle"
+          # ── Enable Core Library Desugaring ───────────────────────────────────
+          # Flutter 3.22+ generates build.gradle.kts (Kotlin DSL), older versions
+          # generate build.gradle (Groovy). We use find to handle both.
+          GRADLE=$(find android/app -maxdepth 1 -name "build.gradle*" | head -1)
+          if [ -z "$GRADLE" ]; then
+            echo "❌ build.gradle not found!" && exit 1
+          fi
+          echo "✅ Patching desugaring in: $GRADLE"
           sed -i 's/compileOptions {/compileOptions {\n        isCoreLibraryDesugaringEnabled = true/' "$GRADLE"
           sed -i 's/dependencies {/dependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")/' "$GRADLE"
-          echo "✅ Desugaring enabled in $GRADLE"
 
       # ── Step 2: AndroidManifest ───────────────────────────────────────────────
       - name: Inject Permissions and Manifest Settings
@@ -302,12 +307,14 @@ jobs:
                   } catch (_) {}
                 },
               );
-              final jsCode = "(function(){"
-                "function notify(el){if(!el)return;window.flutter_inappwebview.callHandler('titanMediaUpdate',{playing:!el.paused,title:document.title||'',artUrl:(function(){var og=document.querySelector('meta[property=\'og:image\']');return og?og.getAttribute('content'):'';})()});}"
-                "function attach(el){['play','pause','ended'].forEach(function(e){el.addEventListener(e,function(){notify(el);});});}"
-                "document.querySelectorAll('video,audio').forEach(attach);"
-                "new MutationObserver(function(ms){ms.forEach(function(m){m.addedNodes.forEach(function(n){if(n.tagName==='VIDEO'||n.tagName==='AUDIO')attach(n);});});}).observe(document.body,{childList:true,subtree:true});"
-                "})();";
+              const jsCode =  +
+              r"(function(){" +
+              r"function notify(el){if(!el)return;window.flutter_inappwebview.callHandler('titanMediaUpdate',{playing:!el.paused,title:document.title||'',artUrl:(function(){var og=document.querySelector('meta[property="og:image"]');return og?og.getAttribute('content'):'';})()});}" +
+              r"function attach(el){['play','pause','ended'].forEach(function(e){el.addEventListener(e,function(){notify(el);});});}" +
+              r"document.querySelectorAll('video,audio').forEach(attach);" +
+              r"new MutationObserver(function(ms){ms.forEach(function(m){m.addedNodes.forEach(function(n){if(n.tagName==='VIDEO'||n.tagName==='AUDIO')attach(n);});});}).observe(document.body,{childList:true,subtree:true});" +
+              r"})();" +
+              ;
               ctrl.evaluateJavascript(source: jsCode);
             }
 
