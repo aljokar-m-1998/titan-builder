@@ -66,7 +66,7 @@ jobs:
           flutter create --platforms=android --project-name "$APP_SLUG" --org com.titan "$APP_SLUG"
 
           cd "$APP_SLUG"
-          flutter pub add flutter_inappwebview connectivity_plus permission_handler url_launcher shared_preferences path_provider dio device_info_plus just_audio audio_service
+          flutter pub add flutter_inappwebview connectivity_plus permission_handler url_launcher shared_preferences path_provider dio device_info_plus just_audio audio_service open_filex
 
           # ── Enable Core Library Desugaring + minSdk ───────────────────────────
           GRADLE=$(find android/app -maxdepth 1 -name "build.gradle*" | head -1)
@@ -133,7 +133,8 @@ jobs:
               "android.permission.DOWNLOAD_WITHOUT_NOTIFICATION",
               "android.permission.WAKE_LOCK",
               "android.permission.FOREGROUND_SERVICE",
-              "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+              "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+              "android.permission.MANAGE_EXTERNAL_STORAGE",
           ]
 
           if os.environ.get("ENABLE_CAMERA") == "true":
@@ -171,7 +172,7 @@ jobs:
 
           content = content.replace(
               '<application',
-              perms_xml + '\n    <application android:usesCleartextTraffic="true" android:hardwareAccelerated="true" android:largeHeap="true"',
+              perms_xml + '\n    <application android:usesCleartextTraffic="true" android:hardwareAccelerated="true" android:largeHeap="true" android:requestLegacyExternalStorage="true"',
               1
           )
 
@@ -219,6 +220,7 @@ jobs:
           cat > "$APP_SLUG/android/app/src/main/res/xml/file_paths.xml" << 'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <paths>
+              <root-path name="root" path="."/>
               <external-path name="external_files" path="."/>
               <external-cache-path name="external_cache" path="."/>
               <files-path name="internal_files" path="."/>
@@ -246,6 +248,7 @@ jobs:
           import 'package:device_info_plus/device_info_plus.dart';
           import 'package:audio_service/audio_service.dart';
           import 'package:just_audio/just_audio.dart';
+          import 'package:open_filex/open_filex.dart';
 
           const String kAppUrl  = 'PLACEHOLDER_URL';
           const String kAppName = 'PLACEHOLDER_NAME';
@@ -422,16 +425,22 @@ jobs:
 
               if (kEnableStorage && Platform.isAndroid) {
                 final sdkInt = await _getSdkInt();
-                if (sdkInt <= 29) {
-                  await Permission.storage.request();
-                } else if (sdkInt <= 32) {
-                  await Permission.storage.request();
-                } else {
+                if (sdkInt >= 33) {
+                  // Android 13+ — granular media permissions
                   await [
                     Permission.photos,
                     Permission.videos,
                     Permission.audio,
                   ].request();
+                } else if (sdkInt >= 30) {
+                  // Android 11-12 — request MANAGE_EXTERNAL_STORAGE for full Downloads access
+                  final manageStatus = await Permission.manageExternalStorage.status;
+                  if (!manageStatus.isGranted) {
+                    await Permission.manageExternalStorage.request();
+                  }
+                } else {
+                  // Android 10 and below
+                  await Permission.storage.request();
                 }
               }
 
@@ -475,83 +484,180 @@ jobs:
             }
 
             Future<void> _handleDownload(String url, String? suggestedFilename, String? mimeType) async {
+              // ── Sanitize filename ──────────────────────────────────────
+              String rawName = (suggestedFilename != null && suggestedFilename.isNotEmpty)
+                  ? suggestedFilename
+                  : Uri.parse(url).pathSegments.lastWhere((s) => s.isNotEmpty, orElse: () => 'download');
+              // Strip query params from name if present
+              if (rawName.contains('?')) rawName = rawName.split('?').first;
+              final name = rawName.isNotEmpty ? rawName : 'download';
+
+              // ── Show persistent progress snackbar ─────────────────────
+              ScaffoldMessengerState? messenger;
+              if (mounted) {
+                messenger = ScaffoldMessenger.of(context);
+                messenger.clearSnackBars();
+                messenger.showSnackBar(
+                  SnackBar(
+                    content: Row(children: [
+                      const SizedBox(width: 20, height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)),
+                      const SizedBox(width: 12),
+                      Expanded(child: Text('⬇️ جاري تحميل \$name...')),
+                    ]),
+                    duration: const Duration(minutes: 5),
+                  ),
+                );
+              }
+
               try {
-                final name = (suggestedFilename != null && suggestedFilename.isNotEmpty)
-                    ? suggestedFilename
-                    : Uri.parse(url).pathSegments.lastWhere((s) => s.isNotEmpty, orElse: () => 'download');
-
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('⬇️ جاري تحميل \$name...'), duration: const Duration(seconds: 2)),
-                  );
-                }
-
+                // ── Download to temp ───────────────────────────────────
                 final dio = Dio();
                 final response = await dio.get<List<int>>(
                   url,
                   options: Options(
                     responseType: ResponseType.bytes,
                     headers: {'User-Agent': kUserAgent},
-                    receiveTimeout: const Duration(minutes: 15),
+                    receiveTimeout: const Duration(minutes: 20),
+                    sendTimeout: const Duration(minutes: 1),
                   ),
                 );
 
                 final bytes = response.data;
-                if (bytes == null || bytes.isEmpty) throw Exception('ملف فارغ');
-
-                String? savedPath;
+                if (bytes == null || bytes.isEmpty) throw Exception('الملف فارغ أو غير متاح');
 
                 final tempDir  = await getTemporaryDirectory();
                 final tempFile = File('\${tempDir.path}/\$name');
-                await tempFile.writeAsBytes(bytes);
-                savedPath = tempFile.path;
+                await tempFile.writeAsBytes(bytes, flush: true);
 
-                if (Platform.isAndroid) {
-                  final sdkInt = await _getSdkInt();
+                if (!Platform.isAndroid) {
+                  // iOS / others — open from temp
+                  final uri = Uri.file(tempFile.path);
+                  if (await canLaunchUrl(uri)) await launchUrl(uri, mode: LaunchMode.externalApplication);
+                  return;
+                }
 
-                  if (sdkInt >= 29) {
-                    try {
-                      const platform = MethodChannel('titan_download');
-                      await platform.invokeMethod('saveToDownloads', {
-                        'sourcePath': savedPath,
-                        'fileName': name,
-                        'mimeType': mimeType ?? 'application/octet-stream',
-                      });
-                    } catch (_) {
-                      final uri = Uri.file(savedPath);
-                      if (await canLaunchUrl(uri)) {
-                        await launchUrl(uri, mode: LaunchMode.externalApplication);
-                      }
-                    }
-                  } else {
+                // ── Android: save via MethodChannel → MediaStore ───────
+                final sdkInt = await _getSdkInt();
+                bool savedOk = false;
+                String? finalPath;
+
+                if (sdkInt >= 29) {
+                  // Android 10+ — use MediaStore (scoped storage)
+                  try {
+                    const platform = MethodChannel('titan_download');
+                    final result = await platform.invokeMethod<String>('saveToDownloads', {
+                      'sourcePath': tempFile.path,
+                      'fileName'  : name,
+                      'mimeType'  : mimeType ?? _guessMime(name),
+                    });
+                    savedOk   = (result == 'saved');
+                    finalPath = savedOk ? '/storage/emulated/0/Download/\$name' : null;
+                  } catch (e) {
+                    debugPrint('MethodChannel error: \$e');
+                    savedOk = false;
+                  }
+                } else {
+                  // Android 9 and below — direct write
+                  try {
                     final status = await Permission.storage.status;
                     if (!status.isGranted) await Permission.storage.request();
                     final dlPath = '/storage/emulated/0/Download/\$name';
-                    await File(dlPath).writeAsBytes(bytes);
-                    savedPath = dlPath;
+                    await File(dlPath).writeAsBytes(bytes, flush: true);
+                    savedOk   = true;
+                    finalPath = dlPath;
+                  } catch (e) {
+                    debugPrint('Legacy write error: \$e');
+                    savedOk = false;
                   }
                 }
 
+                // ── Show result snackbar ───────────────────────────────
                 if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text('✅ تم التحميل: \$name'),
-                    duration: const Duration(seconds: 5),
-                    action: savedPath != null ? SnackBarAction(
-                      label: 'فتح',
-                      onPressed: () => launchUrl(Uri.file(savedPath!), mode: LaunchMode.externalApplication),
-                    ) : null,
-                  ));
+                  messenger?.clearSnackBars();
+                  if (savedOk) {
+                    messenger?.showSnackBar(SnackBar(
+                      content: Text('✅ تم الحفظ في التنزيلات: \$name'),
+                      duration: const Duration(seconds: 6),
+                      backgroundColor: Colors.green.shade700,
+                      action: SnackBarAction(
+                        label: 'فتح',
+                        textColor: Colors.white,
+                        onPressed: () async {
+                          // Try MediaStore URI first, fallback to file URI
+                          try {
+                            const platform = MethodChannel('titan_download');
+                            await platform.invokeMethod('openDownloadsFolder');
+                          } catch (_) {
+                            if (finalPath != null) {
+                              final uri = Uri.file(finalPath!);
+                              if (await canLaunchUrl(uri)) {
+                                await launchUrl(uri, mode: LaunchMode.externalApplication);
+                              }
+                            }
+                          }
+                        },
+                      ),
+                    ));
+                  } else {
+                    // Fallback: open from temp directory
+                    messenger?.showSnackBar(SnackBar(
+                      content: const Text('⚠️ تعذّر الحفظ في التنزيلات — جاري فتح الملف مباشرة'),
+                      duration: const Duration(seconds: 5),
+                      backgroundColor: Colors.orange.shade700,
+                      action: SnackBarAction(
+                        label: 'فتح',
+                        textColor: Colors.white,
+                        onPressed: () async {
+                          final uri = Uri.file(tempFile.path);
+                          if (await canLaunchUrl(uri)) {
+                            await launchUrl(uri, mode: LaunchMode.externalApplication);
+                          }
+                        },
+                      ),
+                    ));
+                  }
                 }
+
               } catch (e) {
-                final uri = Uri.parse(url);
-                if (await canLaunchUrl(uri)) {
-                  await launchUrl(uri, mode: LaunchMode.externalApplication);
-                } else if (mounted) {
+                debugPrint('Download error: \$e');
+                if (mounted) {
+                  messenger?.clearSnackBars();
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('❌ فشل التحميل')),
+                    SnackBar(
+                      content: Text('❌ فشل التحميل: \${e.toString().split(":").last.trim()}'),
+                      duration: const Duration(seconds: 5),
+                      backgroundColor: Colors.red.shade700,
+                      action: SnackBarAction(
+                        label: 'متصفح',
+                        textColor: Colors.white,
+                        onPressed: () async {
+                          final uri = Uri.parse(url);
+                          if (await canLaunchUrl(uri)) {
+                            await launchUrl(uri, mode: LaunchMode.externalApplication);
+                          }
+                        },
+                      ),
+                    ),
                   );
                 }
               }
+            }
+
+            // ── MIME type guesser from extension ─────────────────────────
+            String _guessMime(String filename) {
+              final ext = filename.split('.').last.toLowerCase();
+              const map = {
+                'mp4': 'video/mp4', 'mkv': 'video/x-matroska', 'avi': 'video/x-msvideo',
+                'mov': 'video/quicktime', 'webm': 'video/webm', '3gp': 'video/3gpp',
+                'mp3': 'audio/mpeg', 'aac': 'audio/aac', 'm4a': 'audio/mp4',
+                'ogg': 'audio/ogg', 'wav': 'audio/wav', 'flac': 'audio/flac',
+                'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+                'gif': 'image/gif', 'webp': 'image/webp',
+                'pdf': 'application/pdf', 'zip': 'application/zip',
+                'apk': 'application/vnd.android.package-archive',
+              };
+              return map[ext] ?? 'application/octet-stream';
             }
 
             @override
@@ -690,6 +796,9 @@ jobs:
           package com.titan.APP_SLUG_PLACEHOLDER
 
           import android.content.ContentValues
+          import android.content.Intent
+          import android.media.MediaScannerConnection
+          import android.net.Uri
           import android.os.Build
           import android.os.Environment
           import android.provider.MediaStore
@@ -705,45 +814,74 @@ jobs:
               super.configureFlutterEngine(flutterEngine)
               MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
                 .setMethodCallHandler { call, result ->
-                  if (call.method == "saveToDownloads") {
-                    val sourcePath = call.argument<String>("sourcePath") ?: ""
-                    val fileName   = call.argument<String>("fileName")   ?: "download"
-                    val mimeType   = call.argument<String>("mimeType")   ?: "*/*"
-                    try {
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        val values = ContentValues().apply {
-                          put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                          put(MediaStore.Downloads.MIME_TYPE, mimeType)
-                          put(MediaStore.Downloads.IS_PENDING, 1)
-                        }
-                        val uri = contentResolver.insert(
-                          MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
-                        )
-                        if (uri != null) {
-                          contentResolver.openOutputStream(uri)?.use { out ->
-                            File(sourcePath).inputStream().copyTo(out)
+                  when (call.method) {
+
+                    "saveToDownloads" -> {
+                      val sourcePath = call.argument<String>("sourcePath") ?: ""
+                      val fileName   = call.argument<String>("fileName")   ?: "download"
+                      val mimeType   = call.argument<String>("mimeType")   ?: "*/*"
+                      try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          // Android 10+ — MediaStore scoped storage
+                          val values = ContentValues().apply {
+                            put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                            put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                            put(MediaStore.Downloads.IS_PENDING, 1)
                           }
-                          values.clear()
-                          values.put(MediaStore.Downloads.IS_PENDING, 0)
-                          contentResolver.update(uri, values, null, null)
-                          result.success("saved")
+                          val uri = contentResolver.insert(
+                            MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
+                          )
+                          if (uri != null) {
+                            contentResolver.openOutputStream(uri)?.use { out ->
+                              File(sourcePath).inputStream().use { it.copyTo(out) }
+                            }
+                            values.clear()
+                            values.put(MediaStore.Downloads.IS_PENDING, 0)
+                            contentResolver.update(uri, values, null, null)
+                            result.success("saved")
+                          } else {
+                            result.error("MEDIA_STORE_FAIL", "Could not create MediaStore entry", null)
+                          }
                         } else {
-                          result.error("FAILED", "Could not create MediaStore entry", null)
-                        }
-                      } else {
-                        val dest = File(
-                          Environment.getExternalStoragePublicDirectory(
+                          // Android 9 and below — direct filesystem write
+                          val dlDir = Environment.getExternalStoragePublicDirectory(
                             Environment.DIRECTORY_DOWNLOADS
-                          ), fileName
-                        )
-                        File(sourcePath).copyTo(dest, overwrite = true)
-                        result.success("saved")
+                          )
+                          dlDir.mkdirs()
+                          val dest = File(dlDir, fileName)
+                          File(sourcePath).copyTo(dest, overwrite = true)
+                          // Notify gallery/file manager
+                          MediaScannerConnection.scanFile(
+                            this, arrayOf(dest.absolutePath), arrayOf(mimeType), null
+                          )
+                          result.success("saved")
+                        }
+                      } catch (e: Exception) {
+                        result.error("SAVE_ERROR", e.message ?: "Unknown error", null)
                       }
-                    } catch (e: Exception) {
-                      result.error("ERROR", e.message, null)
                     }
-                  } else {
-                    result.notImplemented()
+
+                    "openDownloadsFolder" -> {
+                      try {
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            data = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                          } else {
+                            val dlDir = Environment.getExternalStoragePublicDirectory(
+                              Environment.DIRECTORY_DOWNLOADS
+                            )
+                            data = Uri.fromFile(dlDir)
+                          }
+                          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(intent)
+                        result.success("opened")
+                      } catch (e: Exception) {
+                        result.error("OPEN_ERROR", e.message ?: "Unknown error", null)
+                      }
+                    }
+
+                    else -> result.notImplemented()
                   }
                 }
             }
