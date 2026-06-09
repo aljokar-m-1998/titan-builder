@@ -229,11 +229,12 @@ jobs:
           </paths>
           XML
 
-      # ── Step 3: main.dart ─────────────────────────────────────────────────────
-      - name: Inject Professional main.dart
+      # ── Step 3a: main.dart (part 1/2) ──────────────────────────────────────
+      - name: Write main.dart part 1
+        env:
+          APP_SLUG: ${{ env.APP_SLUG }}
         run: |
-          APP_SLUG=${{ env.APP_SLUG }}
-
+          mkdir -p "$APP_SLUG/lib"
           cat > "$APP_SLUG/lib/main.dart" << 'DART'
           import 'dart:io';
           import 'package:flutter/material.dart';
@@ -386,7 +387,7 @@ jobs:
                   } catch (_) {}
                 },
               );
-              
+    
               final jsCode = '''
               (function(){
                 function notify(el){
@@ -509,6 +510,14 @@ jobs:
                   ),
                 );
               }
+          DART
+
+      # ── Step 3b: main.dart (part 2/2) ──────────────────────────────────────
+      - name: Write main.dart part 2
+        env:
+          APP_SLUG: ${{ env.APP_SLUG }}
+        run: |
+          cat >> "$APP_SLUG/lib/main.dart" << 'DART'
 
               try {
                 // ── Download to temp ───────────────────────────────────
@@ -786,9 +795,11 @@ jobs:
           DART
 
       # ── Step 3b: MainActivity for MediaStore Downloads ─────────────────────────
+      # ── Step 3c: MainActivity for MediaStore Downloads ───────────────────────
       - name: Inject MainActivity Kotlin
+        env:
+          APP_SLUG: ${{ env.APP_SLUG }}
         run: |
-          APP_SLUG=${{ env.APP_SLUG }}
           PKG_PATH="$APP_SLUG/android/app/src/main/kotlin/com/titan/$APP_SLUG"
           mkdir -p "$PKG_PATH"
 
