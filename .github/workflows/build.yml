@@ -95,8 +95,14 @@ jobs:
             echo "❌ build.gradle not found!" && exit 1
           fi
           echo "✅ Patching desugaring in: $GRADLE"
-          sed -i 's/compileOptions {/compileOptions {\n        isCoreLibraryDesugaringEnabled = true/' "$GRADLE"
-          sed -i 's/dependencies {/dependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")/' "$GRADLE"
+
+          # 1) Enable isCoreLibraryDesugaringEnabled inside compileOptions
+          sed -i 's/compileOptions {/compileOptions {\\n        isCoreLibraryDesugaringEnabled = true/' "$GRADLE"
+
+          # 2) Add coreLibraryDesugaring dependency — append to end of file before last }
+          # Using sed to insert before the last closing brace
+          LAST_LINE=$(wc -l < "$GRADLE")
+          sed -i "${LAST_LINE}i\    coreLibraryDesugaring(\"com.android.tools:desugar_jdk_libs:2.1.4\")" "$GRADLE"
 
       # ── Step 2: AndroidManifest ───────────────────────────────────────────────
       - name: Inject Permissions and Manifest Settings
