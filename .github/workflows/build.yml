@@ -87,6 +87,18 @@ jobs:
             audio_service \
             flutter_local_notifications
 
+      # ── Step 1b: Enable Core Library Desugaring ──────────────────────────────
+      - name: Enable Core Library Desugaring
+        run: |
+          APP_SLUG=${{ env.APP_SLUG }}
+          GRADLE="$APP_SLUG/android/app/build.gradle"
+
+          # Enable isCoreLibraryDesugaringEnabled inside compileOptions
+          sed -i 's/compileOptions {/compileOptions {\n        isCoreLibraryDesugaringEnabled = true/' "$GRADLE"
+
+          # Add desugaring dependency inside dependencies block
+          sed -i 's/dependencies {/dependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")/' "$GRADLE"
+
       # ── Step 2: AndroidManifest ───────────────────────────────────────────────
       - name: Inject Permissions and Manifest Settings
         run: |
