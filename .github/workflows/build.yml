@@ -296,14 +296,12 @@ jobs:
                   } catch (_) {}
                 },
               );
-              const jsCode =  +
-              r"(function(){" +
-              r"function notify(el){if(!el)return;window.flutter_inappwebview.callHandler('titanMediaUpdate',{playing:!el.paused,title:document.title||'',artUrl:(function(){var og=document.querySelector('meta[property="og:image"]');return og?og.getAttribute('content'):'';})()});}" +
-              r"function attach(el){['play','pause','ended'].forEach(function(e){el.addEventListener(e,function(){notify(el);});});}" +
-              r"document.querySelectorAll('video,audio').forEach(attach);" +
-              r"new MutationObserver(function(ms){ms.forEach(function(m){m.addedNodes.forEach(function(n){if(n.tagName==='VIDEO'||n.tagName==='AUDIO')attach(n);});});}).observe(document.body,{childList:true,subtree:true});" +
-              r"})();" +
-              ;
+              final jsCode = "(function(){"
+                "function notify(el){if(!el)return;window.flutter_inappwebview.callHandler('titanMediaUpdate',{playing:!el.paused,title:document.title||'',artUrl:(function(){var og=document.querySelector('meta[property=\'og:image\']');return og?og.getAttribute('content'):'';})()});}"
+                "function attach(el){['play','pause','ended'].forEach(function(e){el.addEventListener(e,function(){notify(el);});});}"
+                "document.querySelectorAll('video,audio').forEach(attach);"
+                "new MutationObserver(function(ms){ms.forEach(function(m){m.addedNodes.forEach(function(n){if(n.tagName==='VIDEO'||n.tagName==='AUDIO')attach(n);});});}).observe(document.body,{childList:true,subtree:true});"
+                "})();";
               ctrl.evaluateJavascript(source: jsCode);
             }
 
