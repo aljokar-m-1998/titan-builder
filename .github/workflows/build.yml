@@ -191,7 +191,7 @@ jobs:
                 processingState: AudioProcessingState.idle,
               ));
             }
-            void updateMediaItem(String title, String artUrl) {
+            void setNowPlaying(String title, String artUrl) {
               mediaItem.add(MediaItem(
                 id: 'webview_media',
                 title: title,
@@ -291,7 +291,7 @@ jobs:
                     final playing = data['playing'] as bool? ?? false;
                     final title   = data['title']   as String? ?? kAppName;
                     final artUrl  = data['artUrl']  as String? ?? '';
-                    _audioHandler.updateMediaItem(title, artUrl);
+                    _audioHandler.setNowPlaying(title, artUrl);
                     _audioHandler.updatePlaybackState(playing);
                   } catch (_) {}
                 },
