@@ -85,7 +85,6 @@ jobs:
             device_info_plus \
             just_audio \
             audio_service \
-            flutter_local_notifications
 
           # ── Enable Core Library Desugaring ───────────────────────────────────
           # Flutter 3.22+ generates build.gradle.kts (Kotlin DSL), older versions
@@ -96,11 +95,37 @@ jobs:
           fi
           echo "✅ Patching desugaring in: $GRADLE"
 
-          # 1) Enable isCoreLibraryDesugaringEnabled inside compileOptions
-          sed -i $'s/compileOptions {/compileOptions {\\n        isCoreLibraryDesugaringEnabled = true/' "$GRADLE" 
+          # Patch using Python — handles both .kts (Kotlin DSL) and .gradle (Groovy)
+          # Flutter 3.22+ generates .kts files with NO pre-existing dependencies{} block
+          python3 - "$GRADLE" << 'PYEOF'
+import re, sys
 
-          # 2) Add coreLibraryDesugaring dependency — insert inside dependencies {} block
-          sed -i '/^\s*dependencies\s*{/a\        coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")' "$GRADLE" 
+filepath = sys.argv[1]
+content = open(filepath).read()
+
+# 1) Enable isCoreLibraryDesugaringEnabled inside compileOptions
+content = re.sub(
+    r'(compileOptions\s*\{)',
+    r'\1\n        isCoreLibraryDesugaringEnabled = true',
+    content
+)
+
+# 2) Add the coreLibraryDesugaring dependency
+dep_line = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")'
+if re.search(r'^\s*dependencies\s*\{', content, re.MULTILINE):
+    # Insert inside existing dependencies block
+    content = re.sub(
+        r'(\n\s*dependencies\s*\{)',
+        r'\1\n        ' + dep_line,
+        content, count=1
+    )
+else:
+    # No dependencies block — append one at the end of the file
+    content = content.rstrip() + f'\n\ndependencies {{\n    {dep_line}\n}}\n'
+
+open(filepath, 'w').write(content)
+print("✅ Gradle patched successfully")
+PYEOF
 
       # ── Step 2: AndroidManifest ───────────────────────────────────────────────
       - name: Inject Permissions and Manifest Settings
@@ -161,7 +186,6 @@ jobs:
 
           cat > "$APP_SLUG/lib/main.dart" << 'DART'
           import 'dart:io';
-          import 'dart:typed_data';
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
           import 'package:flutter_inappwebview/flutter_inappwebview.dart';
@@ -174,7 +198,6 @@ jobs:
           import 'package:device_info_plus/device_info_plus.dart';
           import 'package:audio_service/audio_service.dart';
           import 'package:just_audio/just_audio.dart';
-          import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
           const String kAppUrl  = 'PLACEHOLDER_URL';
           const String kAppName = 'PLACEHOLDER_NAME';
