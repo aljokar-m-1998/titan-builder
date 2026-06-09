@@ -97,12 +97,10 @@ jobs:
           echo "✅ Patching desugaring in: $GRADLE"
 
           # 1) Enable isCoreLibraryDesugaringEnabled inside compileOptions
-          sed -i 's/compileOptions {/compileOptions {\\n        isCoreLibraryDesugaringEnabled = true/' "$GRADLE"
+          sed -i $'s/compileOptions {/compileOptions {\\n        isCoreLibraryDesugaringEnabled = true/' "$GRADLE" 
 
-          # 2) Add coreLibraryDesugaring dependency — append to end of file before last }
-          # Using sed to insert before the last closing brace
-          LAST_LINE=$(wc -l < "$GRADLE")
-          sed -i "${LAST_LINE}i\    coreLibraryDesugaring(\"com.android.tools:desugar_jdk_libs:2.1.4\")" "$GRADLE"
+          # 2) Add coreLibraryDesugaring dependency — insert inside dependencies {} block
+          sed -i '/^\s*dependencies\s*{/a\        coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")' "$GRADLE" 
 
       # ── Step 2: AndroidManifest ───────────────────────────────────────────────
       - name: Inject Permissions and Manifest Settings
@@ -313,14 +311,13 @@ jobs:
                   } catch (_) {}
                 },
               );
-              const jsCode =  +
+              final jsCode =
               r"(function(){" +
               r"function notify(el){if(!el)return;window.flutter_inappwebview.callHandler('titanMediaUpdate',{playing:!el.paused,title:document.title||'',artUrl:(function(){var og=document.querySelector('meta[property="og:image"]');return og?og.getAttribute('content'):'';})()});}" +
               r"function attach(el){['play','pause','ended'].forEach(function(e){el.addEventListener(e,function(){notify(el);});});}" +
               r"document.querySelectorAll('video,audio').forEach(attach);" +
               r"new MutationObserver(function(ms){ms.forEach(function(m){m.addedNodes.forEach(function(n){if(n.tagName==='VIDEO'||n.tagName==='AUDIO')attach(n);});});}).observe(document.body,{childList:true,subtree:true});" +
-              r"})();" +
-              ;
+              r"})();";
               ctrl.evaluateJavascript(source: jsCode);
             }
 
@@ -769,13 +766,13 @@ jobs:
       - name: Build APK
         run: |
           cd "${{ env.APP_SLUG }}"
-          flutter build apk --release --no-shrink
+          flutter build apk --release
 
       # ── Step 8: Build AAB (for Google Play) ──────────────────────────────────
       - name: Build AAB
         run: |
           cd "${{ env.APP_SLUG }}"
-          flutter build appbundle --release --no-shrink
+          flutter build appbundle --release
 
       # ── Step 9: Generate Keystore & Sign ─────────────────────────────────────
       - name: Generate Keystore and Sign APK
@@ -903,7 +900,7 @@ jobs:
                   path_or_fileobj="$RELEASE_ZIP",
                   path_in_repo=path_in_repo,
                   repo_id="$HF_DATASET",
-                  repo_type="model",
+                  repo_type="dataset",
                   token="$HF_TOKEN",
               )
               print(f"https://huggingface.co/$HF_DATASET/resolve/main/{path_in_repo}")
