@@ -57,7 +57,7 @@ jobs:
         with:
           channel: 'stable'
 
-      # ── Step 1: Create Flutter project ───────────────────────────────────────
+      # ── Step 1: Create Flutter project + Enable Desugaring ───────────────────
       - name: Create Flutter WebView project
         run: |
           APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" \
@@ -87,17 +87,11 @@ jobs:
             audio_service \
             flutter_local_notifications
 
-      # ── Step 1b: Enable Core Library Desugaring ──────────────────────────────
-      - name: Enable Core Library Desugaring
-        run: |
-          APP_SLUG=${{ env.APP_SLUG }}
-          GRADLE="$APP_SLUG/android/app/build.gradle"
-
-          # Enable isCoreLibraryDesugaringEnabled inside compileOptions
+          # ── Enable Core Library Desugaring (required by flutter_local_notifications) ──
+          GRADLE="android/app/build.gradle"
           sed -i 's/compileOptions {/compileOptions {\n        isCoreLibraryDesugaringEnabled = true/' "$GRADLE"
-
-          # Add desugaring dependency inside dependencies block
           sed -i 's/dependencies {/dependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")/' "$GRADLE"
+          echo "✅ Desugaring enabled in $GRADLE"
 
       # ── Step 2: AndroidManifest ───────────────────────────────────────────────
       - name: Inject Permissions and Manifest Settings
