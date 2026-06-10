@@ -504,7 +504,6 @@ jobs:
                 },
                 androidCompactActionIndices: const [0],
                 processingState: AudioProcessingState.ready,
-                updateTime: DateTime.now(),
               ));
             }
           }
