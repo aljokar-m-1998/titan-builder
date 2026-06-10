@@ -1,4 +1,4 @@
-name: Titan WebView Builder Pro v3
+name: Titan WebView Builder Pro v3 (Unified)
 
 on:
   workflow_dispatch:
@@ -41,6 +41,14 @@ on:
       hf_dataset:
         description: 'HF Dataset repo (owner/name)'
         required: true
+      build_type:
+        description: 'Build type: webview | pwa_twa | twa_native'
+        required: false
+        default: 'webview'
+      manifest_url:
+        description: 'PWA manifest.json URL (for pwa_twa mode)'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -57,8 +65,175 @@ jobs:
         with:
           channel: 'stable'
 
-      # ── Step 1: Create Flutter project ───────────────────────────────────────
+      # ── Step 0: Detect build type ──────────────────────────────────────────
+      - name: Detect Build Type
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          BUILD_TYPE="${BUILD_TYPE:-webview}"
+          echo "BUILD_TYPE=$BUILD_TYPE" >> $GITHUB_ENV
+          echo "🔍 Build type: $BUILD_TYPE"
+
+      # ── Step 1 (TWA/PWA): Bubblewrap Build ─────────────────────────────────
+      - name: Build TWA App with Bubblewrap
+        if: env.BUILD_TYPE == 'pwa_twa' || env.BUILD_TYPE == 'twa_native'
+        run: |
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          APP_URL="${{ github.event.inputs.app_url }}"
+          MANIFEST_URL="${{ github.event.inputs.manifest_url }}"
+          TRACKING="${{ github.event.inputs.tracking_id }}"
+          ICON_URL="${{ github.event.inputs.icon_url }}"
+          HF_TOKEN="${{ github.event.inputs.hf_token }}"
+          HF_DATASET="${{ github.event.inputs.hf_dataset }}"
+
+          # Determine manifest URL
+          if [ -z "$MANIFEST_URL" ]; then
+            MANIFEST_URL="${APP_URL%/}/manifest.json"
+          fi
+
+          echo "📋 Manifest: $MANIFEST_URL"
+
+          # Install Node + Bubblewrap
+          node --version
+          npm install -g @bubblewrap/cli 2>&1 | tail -3
+
+          # Fetch manifest to get app info
+          echo "📡 Fetching manifest..."
+          curl -s -L "$MANIFEST_URL" -o /tmp/manifest.json || echo "{}" > /tmp/manifest.json
+          cat /tmp/manifest.json | python3 -c "
+          import json, sys, os
+          try:
+            m = json.load(sys.stdin)
+            name = m.get('name', os.environ.get('APP_NAME','App'))
+            short = m.get('short_name', name)[:12]
+            color = m.get('theme_color','#1a1a2e').replace('#','')
+            bg    = m.get('background_color','#ffffff').replace('#','')
+            icons = m.get('icons',[])
+            icon  = next((i['src'] for i in sorted(icons, key=lambda x: int(str(x.get('sizes','0x0')).split('x')[0]) if str(x.get('sizes','0x0')).split('x')[0].isdigit() else 0, reverse=True) if '512' in str(i.get('sizes','')) or '192' in str(i.get('sizes',''))), '')
+            # Write to github env
+            with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'MANIFEST_NAME={name}\n')
+              f.write(f'MANIFEST_SHORT={short}\n')
+              f.write(f'MANIFEST_THEME={color}\n')
+              f.write(f'MANIFEST_BG={bg}\n')
+              f.write(f'MANIFEST_ICON={icon}\n')
+            print(f'✅ name={name}, icon={icon}')
+          except Exception as e:
+            print(f'⚠️ manifest parse error: {e}')
+            with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'MANIFEST_NAME={os.environ.get("APP_NAME","App")}\n')
+          " || true
+
+          APP_SLUG=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          echo "APP_SLUG=$APP_SLUG" >> $GITHUB_ENV
+
+          # Download icon
+          ICON_SRC="${ICON_URL:-$MANIFEST_ICON}"
+          if [ -n "$ICON_SRC" ]; then
+            curl -sL "$ICON_SRC" -o /tmp/icon.png 2>/dev/null || true
+          fi
+          [ -f /tmp/icon.png ] && [ -s /tmp/icon.png ] || curl -sL "https://via.placeholder.com/512/1a1a2e/ffffff?text=${APP_SLUG:0:2}" -o /tmp/icon.png || true
+
+          # Build bubblewrap project
+          mkdir -p /tmp/twa-project && cd /tmp/twa-project
+
+          # Generate bubblewrap config
+          cat > twa-manifest.json << TWAJSON
+          {
+            "packageId": "com.titan.${APP_SLUG}",
+            "host": "$(echo $APP_URL | python3 -c 'import sys; from urllib.parse import urlparse; u=urlparse(sys.stdin.read().strip()); print(u.netloc)')",
+            "name": "${MANIFEST_NAME:-$APP_NAME}",
+            "launcherName": "${MANIFEST_SHORT:-$APP_NAME}",
+            "display": "standalone",
+            "orientation": "default",
+            "themeColor": "#${MANIFEST_THEME:-1a1a2e}",
+            "navigationColor": "#${MANIFEST_THEME:-1a1a2e}",
+            "backgroundColor": "#${MANIFEST_BG:-ffffff}",
+            "enableNotifications": ${{ github.event.inputs.enable_notifications == 'true' && 'true' || 'false' }},
+            "startUrl": "/",
+            "iconUrl": "${ICON_SRC}",
+            "maskableIconUrl": "${ICON_SRC}",
+            "monochromeIconUrl": "",
+            "shortcuts": [],
+            "generatorApp": "titan-builder",
+            "webManifestUrl": "${MANIFEST_URL}",
+            "fallbackType": "customtabs",
+            "features": {
+              "locationDelegation": {"enabled": ${{ github.event.inputs.enable_location == 'true' && 'true' || 'false' }}},
+              "playBilling":        {"enabled": false},
+              "arcore":             {"enabled": false}
+            },
+            "alphaDependencies": {"enabled": false},
+            "enableSiteSettingsShortcut": true,
+            "isChromeOSOnly": false,
+            "isMetaQuest": false,
+            "fullScopeUrl": "${APP_URL}",
+            "minSdkVersion": 21,
+            "signingKey": {
+              "path": "./android.keystore",
+              "alias": "titan-${APP_SLUG}"
+            },
+            "splashScreenFadeOutDuration": 300,
+            "appVersionName": "1.0.0",
+            "appVersionCode": 1
+          }
+          TWAJSON
+
+          # Copy icon to expected path
+          mkdir -p /tmp/twa-project
+          cp /tmp/icon.png /tmp/twa-project/icon.png 2>/dev/null || true
+
+          # Generate keystore
+          KS_PASS="$(openssl rand -hex 16)"
+          KEY_ALIAS="titan-${APP_SLUG}"
+          KEY_PASS="$(openssl rand -hex 16)"
+          echo "KS_PASS=$KS_PASS"   >> $GITHUB_ENV
+          echo "KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
+          echo "KEY_PASS=$KEY_PASS"  >> $GITHUB_ENV
+
+          keytool -genkey -v             -keystore /tmp/twa-project/android.keystore             -keyalg RSA -keysize 2048 -validity 10000             -alias "$KEY_ALIAS"             -storepass "$KS_PASS"             -keypass "$KEY_PASS"             -dname "CN=$APP_NAME, OU=App, O=Titan, L=City, S=State, C=US"
+
+          # Init and build via bubblewrap
+          cd /tmp/twa-project
+          npx @bubblewrap/cli init --manifest="$MANIFEST_URL" --directory=. 2>&1 | tail -20 || true
+
+          # If bubblewrap init fails, use gradle directly
+          if [ ! -f "gradlew" ]; then
+            echo "⚠️ Bubblewrap init incomplete, using manual TWA setup..."
+            git clone --depth=1 https://github.com/GoogleChromeLabs/svgomg-twa.git /tmp/twa-template 2>/dev/null || true
+            cp -r /tmp/twa-template/. /tmp/twa-project/ 2>/dev/null || true
+
+            # Patch the TWA template with our values
+            find /tmp/twa-project -name "*.gradle" -o -name "*.xml" -o -name "*.json" | while read f; do
+              sed -i "s|svgomg.firebaseapp.com|$(echo $APP_URL | python3 -c 'import sys; from urllib.parse import urlparse; u=urlparse(sys.stdin.read().strip()); print(u.netloc)')|g" "$f" 2>/dev/null || true
+              sed -i "s|com.chromestatus.svgomg|com.titan.${APP_SLUG}|g" "$f" 2>/dev/null || true
+              sed -i "s|SVGOMG|$APP_NAME|g" "$f" 2>/dev/null || true
+            done
+          fi
+
+          # Build
+          chmod +x gradlew 2>/dev/null || true
+          ./gradlew assembleRelease 2>&1 | tail -30 || true
+
+          # Sign if APK exists
+          APK=$(find /tmp/twa-project -name "*.apk" | head -1)
+          if [ -n "$APK" ] && [ -f "$APK" ]; then
+            BUILD_TOOLS=$(ls -d $ANDROID_SDK_ROOT/build-tools/* | tail -1)
+            $BUILD_TOOLS/apksigner sign               --ks /tmp/twa-project/android.keystore               --ks-key-alias "$KEY_ALIAS"               --ks-pass "pass:$KS_PASS"               --key-pass "pass:$KEY_PASS"               "$APK" 2>/dev/null || true
+            echo "TWA_APK=$APK" >> $GITHUB_ENV
+            echo "✅ TWA APK ready: $APK"
+          else
+            echo "❌ TWA build failed — falling back to WebView"
+            echo "BUILD_TYPE=webview" >> $GITHUB_ENV
+          fi
+
+          # AAB
+          ./gradlew bundleRelease 2>&1 | tail -10 || true
+          AAB=$(find /tmp/twa-project -name "*.aab" | head -1)
+          [ -n "$AAB" ] && echo "TWA_AAB=$AAB" >> $GITHUB_ENV || true
+
+      # ── Step 2 (WebView): Create Flutter project ───────────────────────────
       - name: Create Flutter WebView project
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
           echo "APP_SLUG=$APP_SLUG" >> $GITHUB_ENV
@@ -68,7 +243,7 @@ jobs:
           cd "$APP_SLUG"
           flutter pub add flutter_inappwebview connectivity_plus permission_handler url_launcher shared_preferences path_provider device_info_plus just_audio audio_service
 
-          # ── Enable Core Library Desugaring + minSdk ───────────────────────────
+          # Enable Core Library Desugaring + minSdk
           GRADLE=$(find android/app -maxdepth 1 -name "build.gradle*" | head -1)
           if [ -z "$GRADLE" ]; then
             echo "❌ build.gradle not found!" && exit 1
@@ -107,8 +282,9 @@ jobs:
           print("✅ Gradle patched successfully")
           PYEOF
 
-      # ── Step 2: AndroidManifest ───────────────────────────────────────────────
+      # ── Step 3: AndroidManifest permissions & settings ─────────────────────
       - name: Inject Permissions and Manifest Settings
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         env:
           ENABLE_CAMERA: ${{ github.event.inputs.enable_camera }}
           ENABLE_STORAGE: ${{ github.event.inputs.enable_storage }}
@@ -229,8 +405,9 @@ jobs:
           </paths>
           XML
 
-      # ── Step 3a: main.dart (part 1/2) ──────────────────────────────────
-      - name: Write main.dart part 1
+      # ── Step 4: Write main.dart (part 1/3) ─────────────────────────────────
+      - name: Write main.dart part 1 (imports, AudioHandler, main)
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         env:
           APP_SLUG: ${{ env.APP_SLUG }}
         run: |
@@ -261,6 +438,19 @@ jobs:
             'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro Build/UQ1A.240105.004) '
             'AppleWebKit/537.36 (KHTML, like Gecko) '
             'Chrome/124.0.6367.82 Mobile Safari/537.36';
+
+          String _guessMime(String fileName) {
+            final ext = fileName.toLowerCase().split('.').last;
+            switch (ext) {
+              case 'jpg': case 'jpeg': return 'image/jpeg';
+              case 'png': return 'image/png';
+              case 'gif': return 'image/gif';
+              case 'mp4': return 'video/mp4';
+              case 'mp3': return 'audio/mpeg';
+              case 'pdf': return 'application/pdf';
+              default: return 'application/octet-stream';
+            }
+          }
 
           class TitanAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
             @override
@@ -296,7 +486,6 @@ jobs:
                 artUri:  art,
                 playable: true,
               ));
-              // Ensure playback state is ready so notification shows
               if (playbackState.value.processingState == AudioProcessingState.idle) {
                 updatePlaybackState(true);
               }
@@ -392,8 +581,15 @@ jobs:
               });
             }
 
+            Future<String> _writeTempFile(List<int> bytes, String name) async {
+              final dir  = await getTemporaryDirectory();
+              final file = File('${dir.path}/$name');
+              await file.writeAsBytes(bytes, flush: true);
+              return file.path;
+            }
+
             void _setupMediaBridge(InAppWebViewController ctrl) {
-              // ── 1. Audio notification bridge ─────────────────────────────────
+              // Handler: update media notification
               ctrl.addJavaScriptHandler(
                 handlerName: 'titanMediaUpdate',
                 callback: (args) {
@@ -410,7 +606,7 @@ jobs:
                 },
               );
 
-              // ── 2. Save image/file to device (MediaStore) ────────────────────
+              // Handler: save image (base64) to device gallery/downloads
               ctrl.addJavaScriptHandler(
                 handlerName: 'saveToGallery',
                 callback: (args) async {
@@ -438,7 +634,7 @@ jobs:
                 },
               );
 
-              // ── 3. Save arbitrary decrypted file bytes from JS ───────────────
+              // Handler: save arbitrary file bytes from JS
               ctrl.addJavaScriptHandler(
                 handlerName: 'saveFileBytes',
                 callback: (args) async {
@@ -467,12 +663,11 @@ jobs:
                 },
               );
 
-              // ── 4. Get device video list for native gallery picker ────────────
+              // Handler: get list of device videos with thumbnails
               ctrl.addJavaScriptHandler(
                 handlerName: 'getNativeVideos',
                 callback: (args) async {
                   try {
-                    // Request correct permission based on Android version
                     final sdkInt = await _getSdkInt();
                     bool granted = false;
                     if (sdkInt >= 33) {
@@ -498,7 +693,7 @@ jobs:
                 },
               );
 
-              // ── Inject JS media observer (picks up tc-media-title correctly) ─
+              // Inject JS to detect media elements and notify
               final jsCode = r"""
               (function(){
                 function getTitle(){
@@ -533,19 +728,15 @@ jobs:
               """;
               ctrl.evaluateJavascript(source: jsCode);
             }
+          DART
 
-            // ── Helper: write bytes to temp, return path ──────────────────────
-            Future<String> _writeTempFile(List<int> bytes, String name) async {
-              final dir  = await getTemporaryDirectory();
-              final file = File('${dir.path}/$name');
-              await file.writeAsBytes(bytes, flush: true);
-              return file.path;
-            }
-            @override
-            void dispose() {
-              WidgetsBinding.instance.removeObserver(this);
-              super.dispose();
-            }
+      # ── Step 5: Write main.dart part 2 (rest of class) ─────────────────────
+      - name: Write main.dart part 2 (methods & build)
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
+        env:
+          APP_SLUG: ${{ env.APP_SLUG }}
+        run: |
+          cat >> "$APP_SLUG/lib/main.dart" << 'DART'
 
             Future<void> _requestPermissions() async {
               if (kEnableCamera) {
@@ -559,20 +750,17 @@ jobs:
               if (kEnableStorage && Platform.isAndroid) {
                 final sdkInt = await _getSdkInt();
                 if (sdkInt >= 33) {
-                  // Android 13+ — granular media permissions
                   await [
                     Permission.photos,
                     Permission.videos,
                     Permission.audio,
                   ].request();
                 } else if (sdkInt >= 30) {
-                  // Android 11-12 — request MANAGE_EXTERNAL_STORAGE for full Downloads access
                   final manageStatus = await Permission.manageExternalStorage.status;
                   if (!manageStatus.isGranted) {
                     await Permission.manageExternalStorage.request();
                   }
                 } else {
-                  // Android 10 and below
                   await Permission.storage.request();
                 }
               }
@@ -589,14 +777,6 @@ jobs:
                 }
               }
             }
-          DART
-
-      # ── Step 3b: main.dart (part 2/2) ──────────────────────────────────
-      - name: Write main.dart part 2
-        env:
-          APP_SLUG: ${{ env.APP_SLUG }}
-        run: |
-          cat >> "$APP_SLUG/lib/main.dart" << 'DART'
 
             Future<int> _getSdkInt() async {
               try {
@@ -624,20 +804,24 @@ jobs:
               SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
             }
 
-                        Future<void> _handleDownload(String url, String? suggestedFilename, String? mimeType) async {
-                        final uri = Uri.parse(url);
-                        try {
-                          await launchUrl(uri, mode: LaunchMode.externalApplication);
-                        } catch (_) {
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('تعذّر فتح رابط التحميل')),
-                            );
-                          }
-                        }
-                      }
+            Future<void> _handleDownload(String url, String? suggestedFilename, String? mimeType) async {
+              final uri = Uri.parse(url);
+              try {
+                await launchUrl(uri, mode: LaunchMode.externalApplication);
+              } catch (_) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('تعذّر فتح رابط التحميل')),
+                  );
+                }
+              }
+            }
 
-
+            @override
+            void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
+              super.dispose();
+            }
 
             @override
             Widget build(BuildContext context) {
@@ -755,7 +939,6 @@ jobs:
                             OutlinedButton.icon(onPressed: () => _ctrl?.loadUrl(urlRequest: URLRequest(url: WebUri(kAppUrl))), icon: const Icon(Icons.home_rounded), label: const Text('الرئيسية')),
                           ]),
                         ]))),
-
                     ]),
                   ),
                 ),
@@ -764,8 +947,9 @@ jobs:
           }
           DART
 
-      # ── Step 3c: MainActivity (MediaStore Downloads) ────────────────────
-      - name: Inject MainActivity Kotlin
+      # ── Step 6: MainActivity.kt with full features ──────────────────────────
+      - name: Inject MainActivity Kotlin (with video & download methods)
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         env:
           APP_SLUG: ${{ env.APP_SLUG }}
         run: |
@@ -807,7 +991,6 @@ jobs:
                       val mimeType   = call.argument<String>("mimeType")   ?: "*/*"
                       try {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                          // Android 10+ — MediaStore scoped storage
                           val values = ContentValues().apply {
                             put(MediaStore.Downloads.DISPLAY_NAME, fileName)
                             put(MediaStore.Downloads.MIME_TYPE, mimeType)
@@ -828,14 +1011,12 @@ jobs:
                             result.error("MEDIA_STORE_FAIL", "Could not create MediaStore entry", null)
                           }
                         } else {
-                          // Android 9 and below — direct filesystem write
                           val dlDir = Environment.getExternalStoragePublicDirectory(
                             Environment.DIRECTORY_DOWNLOADS
                           )
                           dlDir.mkdirs()
                           val dest = File(dlDir, fileName)
                           File(sourcePath).copyTo(dest, overwrite = true)
-                          // Notify gallery/file manager
                           MediaScannerConnection.scanFile(
                             this, arrayOf(dest.absolutePath), arrayOf(mimeType), null
                           )
@@ -905,19 +1086,18 @@ jobs:
                           while (c.moveToNext() && videos.size < 200) {
                             val id       = c.getLong(idCol)
                             val name     = c.getString(nameCol) ?: "Video"
-                            val dur      = c.getLong(durCol) / 1000.0   // ms → seconds
+                            val dur      = c.getLong(durCol) / 1000.0
                             val filePath = c.getString(dataCol) ?: ""
                             val videoUri = Uri.withAppendedPath(
                               MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id.toString()
                             )
-                            // Generate tiny thumbnail (96×96) as base64
                             var thumbB64 = ""
                             try {
                               val bmp: Bitmap? = if (Build.VERSION.SDK_INT >= 29) {
                                 contentResolver.loadThumbnail(videoUri, android.util.Size(96, 96), null)
                               } else {
                                 @Suppress("DEPRECATION")
-                                ThumbnailUtils.createVideoThumbnail(filePath, android.provider.MediaStore.Images.Thumbnails.MINI_KIND)
+                                ThumbnailUtils.createVideoThumbnail(filePath, MediaStore.Images.Thumbnails.MINI_KIND)
                               }
                               if (bmp != null) {
                                 val bos = ByteArrayOutputStream()
@@ -951,8 +1131,9 @@ jobs:
 
           sed -i "s/APP_SLUG_PLACEHOLDER/$APP_SLUG/g" "$PKG_PATH/MainActivity.kt"
 
-      # ── Step 4: Replace placeholders (safe escaping) ─────────────────────────
+      # ── Step 7: Replace placeholders ────────────────────────────────────────
       - name: Replace Template Variables
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
           APP_URL="${{ github.event.inputs.app_url }}"
@@ -971,8 +1152,9 @@ jobs:
           sed -i "s|PLACEHOLDER_CAMERA|$CAM|g"                "$APP_SLUG/lib/main.dart"
           sed -i "s|PLACEHOLDER_STORAGE|$STOR|g"              "$APP_SLUG/lib/main.dart"
 
-      # ── Step 5: App Icon ──────────────────────────────────────────────────────
+      # ── Step 8: App Icon handling ───────────────────────────────────────────
       - name: Handle App Icon
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
           ICON_URL="${{ github.event.inputs.icon_url }}"
@@ -999,26 +1181,30 @@ jobs:
             fi
           fi
 
-      # ── Step 6: Patch ProGuard ────────────────────────────────────────────────
+      # ── Step 9: Patch ProGuard ──────────────────────────────────────────────
       - name: Patch ProGuard
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           find ~/.pub-cache/hosted/pub.dev/ -name "build.gradle" \
             -print0 | xargs -0 sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" 2>/dev/null || true
 
-      # ── Step 7: Build APK ─────────────────────────────────────────────────────
+      # ── Step 10: Build APK ──────────────────────────────────────────────────
       - name: Build APK
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           cd "${{ env.APP_SLUG }}"
           flutter build apk --release
 
-      # ── Step 8: Build AAB (for Google Play) ──────────────────────────────────
+      # ── Step 11: Build AAB ──────────────────────────────────────────────────
       - name: Build AAB
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           cd "${{ env.APP_SLUG }}"
           flutter build appbundle --release
 
-      # ── Step 9: Generate Keystore & Sign ─────────────────────────────────────
+      # ── Step 12: Generate Keystore & Sign ───────────────────────────────────
       - name: Generate Keystore and Sign APK
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
           APP_NAME="${{ github.event.inputs.app_name }}"
@@ -1050,7 +1236,7 @@ jobs:
           echo "KEY_PASS=$KEY_PASS"  >> $GITHUB_ENV
           cp /tmp/release.jks /tmp/release-keystore.jks
 
-      # ── Step 10: Create Release Package ───────────────────────────────────────
+      # ── Step 13: Create Release Package ─────────────────────────────────────
       - name: Create Release Package
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
@@ -1063,9 +1249,20 @@ jobs:
           BUILD_DATE=$(date '+%Y-%m-%d %H:%M UTC')
 
           mkdir -p /tmp/release-package
-          cp "$APP_SLUG/build/app/outputs/flutter-apk/app-release.apk" "/tmp/release-package/${APP_SLUG}-release.apk"
-          cp "$APP_SLUG/build/app/outputs/bundle/release/app-release.aab" "/tmp/release-package/${APP_SLUG}-release.aab"
-          cp /tmp/release-keystore.jks "/tmp/release-package/release-keystore.jks"
+          BUILD_TYPE="${{ env.BUILD_TYPE }}"
+          if [ "$BUILD_TYPE" = "pwa_twa" ] || [ "$BUILD_TYPE" = "twa_native" ]; then
+            TWA_APK="${{ env.TWA_APK }}"
+            TWA_AAB="${{ env.TWA_AAB }}"
+            [ -n "$TWA_APK" ] && [ -f "$TWA_APK" ] && cp "$TWA_APK" "/tmp/release-package/${APP_SLUG}-twa-release.apk" || echo "⚠️ TWA APK not found"
+            [ -n "$TWA_AAB" ] && [ -f "$TWA_AAB" ] && cp "$TWA_AAB" "/tmp/release-package/${APP_SLUG}-twa-release.aab" || echo "ℹ️ TWA AAB not built"
+            cp /tmp/twa-project/android.keystore "/tmp/release-package/release-keystore.jks" 2>/dev/null || true
+            BUILD_LABEL="TWA (Trusted Web Activity — Chrome Engine)"
+          else
+            cp "$APP_SLUG/build/app/outputs/flutter-apk/app-release.apk" "/tmp/release-package/${APP_SLUG}-release.apk" 2>/dev/null || true
+            cp "$APP_SLUG/build/app/outputs/bundle/release/app-release.aab" "/tmp/release-package/${APP_SLUG}-release.aab" 2>/dev/null || true
+            cp /tmp/release-keystore.jks "/tmp/release-package/release-keystore.jks" 2>/dev/null || true
+            BUILD_LABEL="WebView (Flutter Engine)"
+          fi
 
           cat > "/tmp/release-package/README.txt" << 'README'
           ╔══════════════════════════════════════════════════╗
@@ -1076,6 +1273,7 @@ jobs:
           App URL    : $APP_URL
           Build Date : $BUILD_DATE
           Tracking ID: $TRACKING
+          Build Type : $BUILD_LABEL
 
           ── FILES ──────────────────────────────────────────
           ${APP_SLUG}-release.apk  → Install directly on Android
@@ -1092,7 +1290,7 @@ jobs:
           zip -r "release-package-${TRACKING}.zip" release-package/
           echo "RELEASE_ZIP=/tmp/release-package-${TRACKING}.zip" >> $GITHUB_ENV
 
-      # ── Step 11: Upload to HF Dataset CDN ────────────────────────────────────
+      # ── Step 14: Upload to HF Dataset CDN ───────────────────────────────────
       - name: Upload Release Package to HF Dataset
         env:
           TRACKING: ${{ github.event.inputs.tracking_id }}
@@ -1137,7 +1335,7 @@ jobs:
             echo "HF_DOWNLOAD_URL=" >> $GITHUB_ENV
           fi
 
-      # ── Step 12: Upload GitHub Artifact (backup) ──────────────────────────────
+      # ── Step 15: Upload GitHub Artifact ─────────────────────────────────────
       - name: Upload GitHub Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -1145,7 +1343,7 @@ jobs:
           path: /tmp/release-package-${{ github.event.inputs.tracking_id }}.zip
           retention-days: 30
 
-      # ── Step 13: Webhook callback ─────────────────────────────────────────────
+      # ── Step 16: Webhook callback ───────────────────────────────────────────
       - name: Send webhook callback
         if: always()
         run: |
