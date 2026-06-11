@@ -1,4 +1,4 @@
-name: Titan WebView Builder Pro v3 (Unified)
+name: Titan WebView Builder Pro v5
 
 on:
   workflow_dispatch:
@@ -41,14 +41,6 @@ on:
       hf_dataset:
         description: 'HF Dataset repo (owner/name)'
         required: true
-      build_type:
-        description: 'Build type: webview | pwa_twa | twa_native'
-        required: false
-        default: 'webview'
-      manifest_url:
-        description: 'PWA manifest.json URL (for pwa_twa mode)'
-        required: false
-        default: ''
 
 jobs:
   build:
@@ -65,175 +57,8 @@ jobs:
         with:
           channel: 'stable'
 
-      # ── Step 0: Detect build type ──────────────────────────────────────────
-      - name: Detect Build Type
-        run: |
-          BUILD_TYPE="${{ github.event.inputs.build_type }}"
-          BUILD_TYPE="${BUILD_TYPE:-webview}"
-          echo "BUILD_TYPE=$BUILD_TYPE" >> $GITHUB_ENV
-          echo "🔍 Build type: $BUILD_TYPE"
-
-      # ── Step 1 (TWA/PWA): Bubblewrap Build ─────────────────────────────────
-      - name: Build TWA App with Bubblewrap
-        if: env.BUILD_TYPE == 'pwa_twa' || env.BUILD_TYPE == 'twa_native'
-        run: |
-          APP_NAME="${{ github.event.inputs.app_name }}"
-          APP_URL="${{ github.event.inputs.app_url }}"
-          MANIFEST_URL="${{ github.event.inputs.manifest_url }}"
-          TRACKING="${{ github.event.inputs.tracking_id }}"
-          ICON_URL="${{ github.event.inputs.icon_url }}"
-          HF_TOKEN="${{ github.event.inputs.hf_token }}"
-          HF_DATASET="${{ github.event.inputs.hf_dataset }}"
-
-          # Determine manifest URL
-          if [ -z "$MANIFEST_URL" ]; then
-            MANIFEST_URL="${APP_URL%/}/manifest.json"
-          fi
-
-          echo "📋 Manifest: $MANIFEST_URL"
-
-          # Install Node + Bubblewrap
-          node --version
-          npm install -g @bubblewrap/cli 2>&1 | tail -3
-
-          # Fetch manifest to get app info
-          echo "📡 Fetching manifest..."
-          curl -s -L "$MANIFEST_URL" -o /tmp/manifest.json || echo "{}" > /tmp/manifest.json
-          cat /tmp/manifest.json | python3 -c "
-          import json, sys, os
-          try:
-            m = json.load(sys.stdin)
-            name = m.get('name', os.environ.get('APP_NAME','App'))
-            short = m.get('short_name', name)[:12]
-            color = m.get('theme_color','#1a1a2e').replace('#','')
-            bg    = m.get('background_color','#ffffff').replace('#','')
-            icons = m.get('icons',[])
-            icon  = next((i['src'] for i in sorted(icons, key=lambda x: int(str(x.get('sizes','0x0')).split('x')[0]) if str(x.get('sizes','0x0')).split('x')[0].isdigit() else 0, reverse=True) if '512' in str(i.get('sizes','')) or '192' in str(i.get('sizes',''))), '')
-            # Write to github env
-            with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write(f'MANIFEST_NAME={name}\n')
-              f.write(f'MANIFEST_SHORT={short}\n')
-              f.write(f'MANIFEST_THEME={color}\n')
-              f.write(f'MANIFEST_BG={bg}\n')
-              f.write(f'MANIFEST_ICON={icon}\n')
-            print(f'✅ name={name}, icon={icon}')
-          except Exception as e:
-            print(f'⚠️ manifest parse error: {e}')
-            with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write(f'MANIFEST_NAME={os.environ.get("APP_NAME","App")}\n')
-          " || true
-
-          APP_SLUG=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
-          echo "APP_SLUG=$APP_SLUG" >> $GITHUB_ENV
-
-          # Download icon
-          ICON_SRC="${ICON_URL:-$MANIFEST_ICON}"
-          if [ -n "$ICON_SRC" ]; then
-            curl -sL "$ICON_SRC" -o /tmp/icon.png 2>/dev/null || true
-          fi
-          [ -f /tmp/icon.png ] && [ -s /tmp/icon.png ] || curl -sL "https://via.placeholder.com/512/1a1a2e/ffffff?text=${APP_SLUG:0:2}" -o /tmp/icon.png || true
-
-          # Build bubblewrap project
-          mkdir -p /tmp/twa-project && cd /tmp/twa-project
-
-          # Generate bubblewrap config
-          cat > twa-manifest.json << TWAJSON
-          {
-            "packageId": "com.titan.${APP_SLUG}",
-            "host": "$(echo $APP_URL | python3 -c 'import sys; from urllib.parse import urlparse; u=urlparse(sys.stdin.read().strip()); print(u.netloc)')",
-            "name": "${MANIFEST_NAME:-$APP_NAME}",
-            "launcherName": "${MANIFEST_SHORT:-$APP_NAME}",
-            "display": "standalone",
-            "orientation": "default",
-            "themeColor": "#${MANIFEST_THEME:-1a1a2e}",
-            "navigationColor": "#${MANIFEST_THEME:-1a1a2e}",
-            "backgroundColor": "#${MANIFEST_BG:-ffffff}",
-            "enableNotifications": ${{ github.event.inputs.enable_notifications == 'true' && 'true' || 'false' }},
-            "startUrl": "/",
-            "iconUrl": "${ICON_SRC}",
-            "maskableIconUrl": "${ICON_SRC}",
-            "monochromeIconUrl": "",
-            "shortcuts": [],
-            "generatorApp": "titan-builder",
-            "webManifestUrl": "${MANIFEST_URL}",
-            "fallbackType": "customtabs",
-            "features": {
-              "locationDelegation": {"enabled": ${{ github.event.inputs.enable_location == 'true' && 'true' || 'false' }}},
-              "playBilling":        {"enabled": false},
-              "arcore":             {"enabled": false}
-            },
-            "alphaDependencies": {"enabled": false},
-            "enableSiteSettingsShortcut": true,
-            "isChromeOSOnly": false,
-            "isMetaQuest": false,
-            "fullScopeUrl": "${APP_URL}",
-            "minSdkVersion": 21,
-            "signingKey": {
-              "path": "./android.keystore",
-              "alias": "titan-${APP_SLUG}"
-            },
-            "splashScreenFadeOutDuration": 300,
-            "appVersionName": "1.0.0",
-            "appVersionCode": 1
-          }
-          TWAJSON
-
-          # Copy icon to expected path
-          mkdir -p /tmp/twa-project
-          cp /tmp/icon.png /tmp/twa-project/icon.png 2>/dev/null || true
-
-          # Generate keystore
-          KS_PASS="$(openssl rand -hex 16)"
-          KEY_ALIAS="titan-${APP_SLUG}"
-          KEY_PASS="$(openssl rand -hex 16)"
-          echo "KS_PASS=$KS_PASS"   >> $GITHUB_ENV
-          echo "KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
-          echo "KEY_PASS=$KEY_PASS"  >> $GITHUB_ENV
-
-          keytool -genkey -v             -keystore /tmp/twa-project/android.keystore             -keyalg RSA -keysize 2048 -validity 10000             -alias "$KEY_ALIAS"             -storepass "$KS_PASS"             -keypass "$KEY_PASS"             -dname "CN=$APP_NAME, OU=App, O=Titan, L=City, S=State, C=US"
-
-          # Init and build via bubblewrap
-          cd /tmp/twa-project
-          npx @bubblewrap/cli init --manifest="$MANIFEST_URL" --directory=. 2>&1 | tail -20 || true
-
-          # If bubblewrap init fails, use gradle directly
-          if [ ! -f "gradlew" ]; then
-            echo "⚠️ Bubblewrap init incomplete, using manual TWA setup..."
-            git clone --depth=1 https://github.com/GoogleChromeLabs/svgomg-twa.git /tmp/twa-template 2>/dev/null || true
-            cp -r /tmp/twa-template/. /tmp/twa-project/ 2>/dev/null || true
-
-            # Patch the TWA template with our values
-            find /tmp/twa-project -name "*.gradle" -o -name "*.xml" -o -name "*.json" | while read f; do
-              sed -i "s|svgomg.firebaseapp.com|$(echo $APP_URL | python3 -c 'import sys; from urllib.parse import urlparse; u=urlparse(sys.stdin.read().strip()); print(u.netloc)')|g" "$f" 2>/dev/null || true
-              sed -i "s|com.chromestatus.svgomg|com.titan.${APP_SLUG}|g" "$f" 2>/dev/null || true
-              sed -i "s|SVGOMG|$APP_NAME|g" "$f" 2>/dev/null || true
-            done
-          fi
-
-          # Build
-          chmod +x gradlew 2>/dev/null || true
-          ./gradlew assembleRelease 2>&1 | tail -30 || true
-
-          # Sign if APK exists
-          APK=$(find /tmp/twa-project -name "*.apk" | head -1)
-          if [ -n "$APK" ] && [ -f "$APK" ]; then
-            BUILD_TOOLS=$(ls -d $ANDROID_SDK_ROOT/build-tools/* | tail -1)
-            $BUILD_TOOLS/apksigner sign               --ks /tmp/twa-project/android.keystore               --ks-key-alias "$KEY_ALIAS"               --ks-pass "pass:$KS_PASS"               --key-pass "pass:$KEY_PASS"               "$APK" 2>/dev/null || true
-            echo "TWA_APK=$APK" >> $GITHUB_ENV
-            echo "✅ TWA APK ready: $APK"
-          else
-            echo "❌ TWA build failed — falling back to WebView"
-            echo "BUILD_TYPE=webview" >> $GITHUB_ENV
-          fi
-
-          # AAB
-          ./gradlew bundleRelease 2>&1 | tail -10 || true
-          AAB=$(find /tmp/twa-project -name "*.aab" | head -1)
-          [ -n "$AAB" ] && echo "TWA_AAB=$AAB" >> $GITHUB_ENV || true
-
-      # ── Step 2 (WebView): Create Flutter project ───────────────────────────
+      # ── Step 1: Create Flutter project ───────────────────────────────────────
       - name: Create Flutter WebView project
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
           echo "APP_SLUG=$APP_SLUG" >> $GITHUB_ENV
@@ -241,50 +66,30 @@ jobs:
           flutter create --platforms=android --project-name "$APP_SLUG" --org com.titan "$APP_SLUG"
 
           cd "$APP_SLUG"
-          flutter pub add flutter_inappwebview connectivity_plus permission_handler url_launcher shared_preferences path_provider device_info_plus just_audio audio_service
+          # ── FIX: added flutter_local_notifications for native notification API
+          flutter pub add flutter_inappwebview connectivity_plus permission_handler url_launcher shared_preferences path_provider device_info_plus just_audio audio_service flutter_local_notifications
 
-          # Enable Core Library Desugaring + minSdk
           GRADLE=$(find android/app -maxdepth 1 -name "build.gradle*" | head -1)
-          if [ -z "$GRADLE" ]; then
-            echo "❌ build.gradle not found!" && exit 1
-          fi
-          echo "✅ Patching $GRADLE"
+          if [ -z "$GRADLE" ]; then echo "❌ build.gradle not found!" && exit 1; fi
 
           python3 - "$GRADLE" << 'PYEOF'
           import re, sys
           filepath = sys.argv[1]
           content = open(filepath).read()
-
-          content = re.sub(
-              r'(compileOptions\s*\{)',
-              "\\1\n        isCoreLibraryDesugaringEnabled = true",
-              content
-          )
-
+          content = re.sub(r'(compileOptions\s*\{)', "\\1\n        isCoreLibraryDesugaringEnabled = true", content)
           dep_line = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")'
           if re.search(r'^\s*dependencies\s*\{', content, re.MULTILINE):
-              content = re.sub(
-                  r'(\s*dependencies\s*\{)',
-                  "\\1\n    " + dep_line,
-                  content, count=1
-              )
+              content = re.sub(r'(\s*dependencies\s*\{)', "\\1\n    " + dep_line, content, count=1)
           else:
               content = content.rstrip() + f"\n\ndependencies {{\n    {dep_line}\n}}\n"
-
           if 'minSdk' not in content and 'minSdkVersion' not in content:
-              content = re.sub(
-                  r'(defaultConfig\s*\{)',
-                  "\\1\n        minSdk = 21\n        targetSdk = 34",
-                  content, count=1
-              )
-
+              content = re.sub(r'(defaultConfig\s*\{)', "\\1\n        minSdk = 21\n        targetSdk = 34", content, count=1)
           open(filepath, 'w').write(content)
-          print("✅ Gradle patched successfully")
+          print("✅ Gradle patched")
           PYEOF
 
-      # ── Step 3: AndroidManifest permissions & settings ─────────────────────
+      # ── Step 2: AndroidManifest ───────────────────────────────────────────────
       - name: Inject Permissions and Manifest Settings
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         env:
           ENABLE_CAMERA: ${{ github.event.inputs.enable_camera }}
           ENABLE_STORAGE: ${{ github.event.inputs.enable_storage }}
@@ -301,6 +106,7 @@ jobs:
           with open(filepath, 'r') as f:
               content = f.read()
 
+          # ── FIX: POST_NOTIFICATIONS & VIBRATE always included (needed for Notification API override)
           permissions = [
               "android.permission.INTERNET",
               "android.permission.ACCESS_NETWORK_STATE",
@@ -311,6 +117,8 @@ jobs:
               "android.permission.FOREGROUND_SERVICE",
               "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
               "android.permission.MANAGE_EXTERNAL_STORAGE",
+              "android.permission.POST_NOTIFICATIONS",
+              "android.permission.VIBRATE",
           ]
 
           if os.environ.get("ENABLE_CAMERA") == "true":
@@ -338,14 +146,7 @@ jobs:
                   "android.permission.ACCESS_COARSE_LOCATION",
               ])
 
-          if os.environ.get("ENABLE_NOTIFICATIONS") == "true":
-              permissions.extend([
-                  "android.permission.POST_NOTIFICATIONS",
-                  "android.permission.VIBRATE",
-              ])
-
           perms_xml = '\n'.join([f'    <uses-permission android:name="{p}"/>' for p in permissions])
-
           content = content.replace(
               '<application',
               perms_xml + '\n    <application android:usesCleartextTraffic="true" android:hardwareAccelerated="true" android:largeHeap="true" android:requestLegacyExternalStorage="true"',
@@ -391,7 +192,6 @@ jobs:
           print("✅ Manifest patched")
           PYEOF
 
-          # file_paths.xml
           mkdir -p "$APP_SLUG/android/app/src/main/res/xml"
           cat > "$APP_SLUG/android/app/src/main/res/xml/file_paths.xml" << 'XML'
           <?xml version="1.0" encoding="utf-8"?>
@@ -405,9 +205,8 @@ jobs:
           </paths>
           XML
 
-      # ── Step 4: Write main.dart (part 1/3) ─────────────────────────────────
-      - name: Write main.dart part 1 (imports, AudioHandler, main)
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
+      # ── Step 3: main.dart part 1 ─────────────────────────────────────────────
+      - name: Write main.dart part 1 (imports, VideoServer, AudioHandler, handlers)
         env:
           APP_SLUG: ${{ env.APP_SLUG }}
         run: |
@@ -426,6 +225,7 @@ jobs:
           import 'package:device_info_plus/device_info_plus.dart';
           import 'package:audio_service/audio_service.dart';
           import 'package:just_audio/just_audio.dart';
+          import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
           const String kAppUrl  = 'PLACEHOLDER_URL';
           const String kAppName = 'PLACEHOLDER_NAME';
@@ -439,28 +239,110 @@ jobs:
             'AppleWebKit/537.36 (KHTML, like Gecko) '
             'Chrome/124.0.6367.82 Mobile Safari/537.36';
 
-          String _guessMime(String fileName) {
-            final ext = fileName.toLowerCase().split('.').last;
+          String _guessMime(String name) {
+            final ext = name.toLowerCase().split('.').last;
             switch (ext) {
               case 'jpg': case 'jpeg': return 'image/jpeg';
-              case 'png': return 'image/png';
-              case 'gif': return 'image/gif';
-              case 'mp4': return 'video/mp4';
-              case 'mp3': return 'audio/mpeg';
-              case 'pdf': return 'application/pdf';
-              default: return 'application/octet-stream';
+              case 'png':  return 'image/png';
+              case 'gif':  return 'image/gif';
+              case 'webp': return 'image/webp';
+              case 'mp4': case 'm4v': return 'video/mp4';
+              case 'webm': return 'video/webm';
+              case 'mkv':  return 'video/x-matroska';
+              case 'mp3':  return 'audio/mpeg';
+              case 'aac':  return 'audio/aac';
+              case 'ogg':  return 'audio/ogg';
+              case 'pdf':  return 'application/pdf';
+              default:     return 'application/octet-stream';
             }
           }
 
+          // ═══════════════════════════════════════════════════════════════════
+          // FIX #1 — Local HTTP server to stream device videos (with byte-range)
+          // The PWA's CinemaManager expects "localhost:port/path" URLs, not
+          // content:// URIs. This server fulfills those range requests so
+          // seeking works in the HTML <video> element.
+          // ═══════════════════════════════════════════════════════════════════
+          class _TitanVideoServer {
+            static HttpServer? _srv;
+            static int _port = 0;
+
+            static Future<void> start() async {
+              if (_srv != null) return;
+              _srv = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+              _port = _srv!.port;
+              _srv!.listen(_handle, onError: (_) {});
+            }
+
+            static Future<void> _handle(HttpRequest req) async {
+              try {
+                // Handle CORS pre-flight (WebView origin → localhost)
+                req.response.headers.set('Access-Control-Allow-Origin', '*');
+                req.response.headers.set('Access-Control-Allow-Headers', 'Range');
+                req.response.headers.set('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges');
+
+                if (req.method == 'OPTIONS') {
+                  req.response.statusCode = 204;
+                  await req.response.close();
+                  return;
+                }
+
+                final filePath = Uri.decodeComponent(req.requestedUri.path.substring(1));
+                final file = File(filePath);
+                if (!await file.exists()) {
+                  req.response.statusCode = 404;
+                  await req.response.close();
+                  return;
+                }
+
+                final len  = await file.length();
+                final mime = _mime(filePath);
+                req.response.headers.set('Content-Type', mime);
+                req.response.headers.set('Accept-Ranges', 'bytes');
+
+                final range = req.headers.value('range');
+                if (range != null) {
+                  final m = RegExp(r'bytes=(\d*)-(\d*)').firstMatch(range);
+                  final s = (m?.group(1)?.isNotEmpty == true) ? int.parse(m!.group(1)!) : 0;
+                  final e = (m?.group(2)?.isNotEmpty == true) ? int.parse(m!.group(2)!) : len - 1;
+                  final chunkLen = e - s + 1;
+                  req.response.statusCode = 206;
+                  req.response.headers.set('Content-Range', 'bytes $s-$e/$len');
+                  req.response.headers.contentLength = chunkLen;
+                  await req.response.addStream(file.openRead(s, e + 1));
+                } else {
+                  req.response.statusCode = 200;
+                  req.response.headers.contentLength = len;
+                  await req.response.addStream(file.openRead());
+                }
+              } catch (_) {
+                try { req.response.statusCode = 500; } catch (_) {}
+              }
+              try { await req.response.close(); } catch (_) {}
+            }
+
+            static String _mime(String p) {
+              if (p.endsWith('.mp4') || p.endsWith('.m4v')) return 'video/mp4';
+              if (p.endsWith('.mkv'))  return 'video/x-matroska';
+              if (p.endsWith('.avi'))  return 'video/x-msvideo';
+              if (p.endsWith('.mov'))  return 'video/quicktime';
+              if (p.endsWith('.webm')) return 'video/webm';
+              if (p.endsWith('.3gp'))  return 'video/3gpp';
+              return 'video/mp4';
+            }
+
+            static String urlFor(String filePath) =>
+                'http://127.0.0.1:$_port/${Uri.encodeComponent(filePath)}';
+          }
+
+          // ═══════════════════════════════════════════════════════════════════
+          // Audio Handler — controls WebView media from the notification shade
+          // ═══════════════════════════════════════════════════════════════════
           class TitanAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
             @override
-            Future<void> play() async {
-              updatePlaybackState(true);
-            }
+            Future<void> play() async { updatePlaybackState(true); }
             @override
-            Future<void> pause() async {
-              updatePlaybackState(false);
-            }
+            Future<void> pause() async { updatePlaybackState(false); }
             @override
             Future<void> stop() async {
               playbackState.add(playbackState.value.copyWith(
@@ -469,16 +351,12 @@ jobs:
                 controls: [],
               ));
             }
-            @override
-            Future<void> skipToNext() async {}
-            @override
-            Future<void> skipToPrevious() async {}
+            @override Future<void> skipToNext() async {}
+            @override Future<void> skipToPrevious() async {}
 
             void setNowPlaying(String title, String artUrl) {
               Uri? art;
-              if (artUrl.isNotEmpty) {
-                try { art = Uri.parse(artUrl); } catch (_) {}
-              }
+              if (artUrl.isNotEmpty) { try { art = Uri.parse(artUrl); } catch (_) {} }
               mediaItem.add(MediaItem(
                 id:      'webview_media_${DateTime.now().millisecondsSinceEpoch}',
                 title:   title.isNotEmpty ? title : kAppName,
@@ -494,14 +372,8 @@ jobs:
             void updatePlaybackState(bool playing) {
               playbackState.add(playbackState.value.copyWith(
                 playing: playing,
-                controls: [
-                  playing ? MediaControl.pause : MediaControl.play,
-                ],
-                systemActions: const {
-                  MediaAction.play,
-                  MediaAction.pause,
-                  MediaAction.stop,
-                },
+                controls: [playing ? MediaControl.pause : MediaControl.play],
+                systemActions: const {MediaAction.play, MediaAction.pause, MediaAction.stop},
                 androidCompactActionIndices: const [0],
                 processingState: AudioProcessingState.ready,
               ));
@@ -509,10 +381,12 @@ jobs:
           }
 
           TitanAudioHandler? _audioHandler;
+          final FlutterLocalNotificationsPlugin _localNotif = FlutterLocalNotificationsPlugin();
 
           void main() async {
             WidgetsFlutterBinding.ensureInitialized();
 
+            // Audio service (media notification in lock-screen / notification shade)
             try {
               _audioHandler = await AudioService.init(
                 builder: () => TitanAudioHandler(),
@@ -527,22 +401,34 @@ jobs:
                 ),
               );
             } catch (e) {
-              debugPrint('AudioService init skipped/failed: \$e');
+              debugPrint('AudioService init skipped: $e');
             }
+
+            // FIX: Local notifications (for Web Notification API override)
+            await _localNotif.initialize(
+              const InitializationSettings(
+                android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+              ),
+            );
+            await _localNotif
+                .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+                ?.createNotificationChannel(const AndroidNotificationChannel(
+                    'titan_push', 'Titan Notifications',
+                    importance: Importance.high));
+
+            // FIX: Start local video streaming server
+            await _TitanVideoServer.start();
 
             SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
             SystemChrome.setPreferredOrientations([
-              DeviceOrientation.portraitUp,
-              DeviceOrientation.portraitDown,
-              DeviceOrientation.landscapeLeft,
-              DeviceOrientation.landscapeRight,
+              DeviceOrientation.portraitUp, DeviceOrientation.portraitDown,
+              DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight,
             ]);
             runApp(const MyApp());
           }
 
           class MyApp extends StatelessWidget {
             const MyApp({super.key});
-
             @override
             Widget build(BuildContext context) => MaterialApp(
               title: kAppName,
@@ -554,17 +440,19 @@ jobs:
 
           class WebViewPage extends StatefulWidget {
             const WebViewPage({super.key});
-
             @override
             State<WebViewPage> createState() => _WebViewPageState();
           }
 
           class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
             InAppWebViewController? _ctrl;
-            bool _loading    = true;
-            bool _offline    = false;
-            bool _error      = false;
-            bool _fullscreen = false;
+            bool _loading       = true;
+            bool _offline       = false;
+            bool _error         = false;
+            bool _fullscreen    = false;
+            // FIX: track first successful load so offline overlay only blocks
+            // before the PWA's service worker has had a chance to cache content
+            bool _hasLoadedOnce = false;
 
             @override
             void initState() {
@@ -587,82 +475,116 @@ jobs:
               return file.path;
             }
 
+            // ─── All JS handlers registered once per WebView instance ───────
             void _setupMediaBridge(InAppWebViewController ctrl) {
-              // Handler: update media notification
+              // ① Media session (lock-screen / notification shade controls)
               ctrl.addJavaScriptHandler(
                 handlerName: 'titanMediaUpdate',
                 callback: (args) {
                   if (args.isEmpty) return;
                   try {
-                    final data    = args[0] as Map<String, dynamic>;
-                    final playing = data['playing'] as bool? ?? false;
-                    final rawTitle = data['title']  as String? ?? '';
-                    final title   = rawTitle.isNotEmpty ? rawTitle : kAppName;
-                    final artUrl  = data['artUrl']  as String? ?? '';
-                    _audioHandler?.setNowPlaying(title, artUrl);
+                    final data     = args[0] as Map<String, dynamic>;
+                    final playing  = data['playing'] as bool?   ?? false;
+                    final rawTitle = data['title']   as String? ?? '';
+                    final artUrl   = data['artUrl']  as String? ?? '';
+                    _audioHandler?.setNowPlaying(rawTitle.isNotEmpty ? rawTitle : kAppName, artUrl);
                     _audioHandler?.updatePlaybackState(playing);
                   } catch (_) {}
                 },
               );
 
-              // Handler: save image (base64) to device gallery/downloads
+              // ② Save image/base64 to device Downloads
               ctrl.addJavaScriptHandler(
                 handlerName: 'saveToGallery',
                 callback: (args) async {
                   if (args.isEmpty) return 'error';
                   try {
                     final data     = args[0] as Map<String, dynamic>;
-                    final b64Data  = data['data']     as String? ?? '';
-                    final fileName = data['fileName'] as String?
-                        ?? 'Titan_${DateTime.now().millisecondsSinceEpoch}.jpg';
-                    if (b64Data.isEmpty) return 'error';
-                    final raw   = b64Data.contains(',') ? b64Data.split(',').last : b64Data;
+                    final b64      = data['data']     as String? ?? '';
+                    final fileName = data['fileName'] as String? ?? 'Titan_${DateTime.now().millisecondsSinceEpoch}.jpg';
+                    if (b64.isEmpty) return 'error';
+                    final raw   = b64.contains(',') ? b64.split(',').last : b64;
                     final bytes = base64Decode(raw);
                     final tmp   = await _writeTempFile(bytes, fileName);
-                    const platform = MethodChannel('titan_download');
-                    final result   = await platform.invokeMethod<String>('saveToDownloads', {
+                    const ch    = MethodChannel('titan_download');
+                    return await ch.invokeMethod<String>('saveToDownloads', {
                       'sourcePath': tmp,
                       'fileName':   fileName,
                       'mimeType':   _guessMime(fileName),
-                    });
-                    return result ?? 'error';
-                  } catch (e) {
-                    debugPrint('saveToGallery error: $e');
-                    return 'error';
-                  }
+                    }) ?? 'error';
+                  } catch (e) { debugPrint('saveToGallery: $e'); return 'error'; }
                 },
               );
 
-              // Handler: save arbitrary file bytes from JS
+              // ③ Save arbitrary file bytes (blob downloads, etc.)
               ctrl.addJavaScriptHandler(
                 handlerName: 'saveFileBytes',
                 callback: (args) async {
                   if (args.isEmpty) return 'error';
                   try {
                     final data     = args[0] as Map<String, dynamic>;
-                    final b64Data  = data['data']     as String? ?? '';
-                    final fileName = data['fileName'] as String?
-                        ?? 'Titan_${DateTime.now().millisecondsSinceEpoch}';
+                    final b64      = data['data']     as String? ?? '';
+                    final fileName = data['fileName'] as String? ?? 'Titan_${DateTime.now().millisecondsSinceEpoch}';
                     final mimeType = data['mimeType'] as String? ?? _guessMime(fileName);
-                    if (b64Data.isEmpty) return 'error';
-                    final raw   = b64Data.contains(',') ? b64Data.split(',').last : b64Data;
+                    if (b64.isEmpty) return 'error';
+                    final raw   = b64.contains(',') ? b64.split(',').last : b64;
                     final bytes = base64Decode(raw);
                     final tmp   = await _writeTempFile(bytes, fileName);
-                    const platform = MethodChannel('titan_download');
-                    final result   = await platform.invokeMethod<String>('saveToDownloads', {
+                    const ch    = MethodChannel('titan_download');
+                    final ok    = await ch.invokeMethod<String>('saveToDownloads', {
                       'sourcePath': tmp,
                       'fileName':   fileName,
-                      'mimeType':   mimeType,
+                      'mimeType':   mimeType.isEmpty ? _guessMime(fileName) : mimeType,
                     });
-                    return result ?? 'error';
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(ok == 'saved' ? '✅ تم الحفظ في التنزيلات: $fileName' : '❌ فشل الحفظ'),
+                          duration: const Duration(seconds: 3),
+                        ),
+                      );
+                    }
+                    return ok ?? 'error';
                   } catch (e) {
-                    debugPrint('saveFileBytes error: $e');
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('❌ تعذّر حفظ الملف')));
+                    }
+                    debugPrint('saveFileBytes: $e');
                     return 'error';
                   }
                 },
               );
 
-              // Handler: get list of device videos with thumbnails
+              // ④ FIX: Web Notification API → native flutter_local_notifications
+              ctrl.addJavaScriptHandler(
+                handlerName: 'showNotification',
+                callback: (args) async {
+                  if (args.isEmpty) return;
+                  try {
+                    final d     = args[0] as Map<String, dynamic>;
+                    final title = d['title'] as String? ?? 'Titan';
+                    final body  = d['body']  as String? ?? '';
+                    await _localNotif.show(
+                      title.hashCode & 0x7FFFFFFF,
+                      title,
+                      body.isEmpty ? null : body,
+                      const NotificationDetails(
+                        android: AndroidNotificationDetails(
+                          'titan_push', 'Titan Notifications',
+                          importance: Importance.high,
+                          priority:   Priority.high,
+                          icon:       '@mipmap/ic_launcher',
+                        ),
+                      ),
+                    );
+                  } catch (e) { debugPrint('showNotification: $e'); }
+                },
+              );
+
+              // ⑤ FIX: Cinema native video library
+              // Kotlin returns DATA file paths; we wrap them in _TitanVideoServer
+              // URLs so the HTML <video> element can seek properly via byte-range.
               ctrl.addJavaScriptHandler(
                 handlerName: 'getNativeVideos',
                 callback: (args) async {
@@ -670,21 +592,29 @@ jobs:
                     final sdkInt = await _getSdkInt();
                     bool granted = false;
                     if (sdkInt >= 33) {
-                      final s = await Permission.videos.request();
-                      granted = s.isGranted;
+                      granted = (await Permission.videos.request()).isGranted;
                     } else {
-                      final s = await Permission.storage.request();
-                      granted = s.isGranted;
+                      granted = (await Permission.storage.request()).isGranted;
                     }
                     if (!granted) return <Map>[];
 
-                    const platform = MethodChannel('titan_download');
-                    final result   = await platform.invokeMethod<List>('getDeviceVideos');
-                    if (result == null) return <Map>[];
-                    return result
-                        .map((v) => Map<String, dynamic>.from(v as Map))
-                        .where((v) => (v['url'] as String? ?? '').isNotEmpty)
-                        .toList();
+                    const ch = MethodChannel('titan_download');
+                    final raw = await ch.invokeMethod<List>('getDeviceVideos');
+                    if (raw == null || raw.isEmpty) return <Map>[];
+
+                    final videos = <Map<String, dynamic>>[];
+                    for (final item in raw) {
+                      final v        = Map<String, dynamic>.from(item as Map);
+                      final filePath = v['filePath'] as String? ?? '';
+                      if (filePath.isEmpty) continue;
+                      videos.add({
+                        'url':       _TitanVideoServer.urlFor(filePath),
+                        'title':     v['title']     ?? '',
+                        'duration':  v['duration']  ?? 0,
+                        'thumbnail': v['thumbnail'] ?? '',
+                      });
+                    }
+                    return videos;
                   } catch (e) {
                     debugPrint('getNativeVideos error: $e');
                     return <Map>[];
@@ -692,46 +622,128 @@ jobs:
                 },
               );
 
-              // Inject JS to detect media elements and notify
-              final jsCode = r"""
-              (function(){
-                function getTitle(){
-                  var el=document.getElementById('tc-media-title');
-                  if(el&&el.innerText.trim()) return el.innerText.trim();
-                  return document.title||'';
-                }
-                function notify(el){
-                  if(!el) return;
-                  var og=document.querySelector('meta[property="og:image"]');
-                  window.flutter_inappwebview.callHandler('titanMediaUpdate',{
-                    playing:!el.paused,
-                    title:getTitle(),
-                    artUrl:og?og.getAttribute('content'):''
-                  });
-                }
-                function attach(el){
-                  ['play','pause','ended'].forEach(function(ev){
-                    el.addEventListener(ev,function(){ notify(el); });
-                  });
-                }
-                document.querySelectorAll('video,audio').forEach(attach);
-                new MutationObserver(function(ms){
-                  ms.forEach(function(m){
-                    m.addedNodes.forEach(function(n){
-                      if(n.tagName==='VIDEO'||n.tagName==='AUDIO') attach(n);
-                      if(n.querySelectorAll) n.querySelectorAll('video,audio').forEach(attach);
+              // ─── Inject JS on every page load ───────────────────────────────
+              // Uses raw triple-quote so Dart won't interpolate $-signs in JS.
+              ctrl.evaluateJavascript(source: r"""
+                (function() {
+                  'use strict';
+
+                  // ── 1. Media bridge (audio_service notification controls) ──
+                  function _getTitle() {
+                    var el = document.getElementById('tc-media-title');
+                    if (el && el.innerText.trim()) return el.innerText.trim();
+                    return document.title || '';
+                  }
+                  function _notify(el) {
+                    if (!el || !window.flutter_inappwebview) return;
+                    var og = document.querySelector('meta[property="og:image"]');
+                    window.flutter_inappwebview.callHandler('titanMediaUpdate', {
+                      playing: !el.paused,
+                      title:   _getTitle(),
+                      artUrl:  og ? og.getAttribute('content') : ''
                     });
-                  });
-                }).observe(document.body,{childList:true,subtree:true});
-              })();
-              """;
-              ctrl.evaluateJavascript(source: jsCode);
+                  }
+                  function _attach(el) {
+                    if (el._tBridged) return;
+                    el._tBridged = true;
+                    ['play', 'pause', 'ended'].forEach(function(ev) {
+                      el.addEventListener(ev, function() { _notify(el); });
+                    });
+                  }
+                  document.querySelectorAll('video,audio').forEach(_attach);
+                  if (!window._tMO) {
+                    window._tMO = new MutationObserver(function(ms) {
+                      ms.forEach(function(m) {
+                        m.addedNodes.forEach(function(n) {
+                          if (n.tagName === 'VIDEO' || n.tagName === 'AUDIO') _attach(n);
+                          if (n.querySelectorAll) n.querySelectorAll('video,audio').forEach(_attach);
+                        });
+                      });
+                    });
+                    window._tMO.observe(document.documentElement, { childList: true, subtree: true });
+                  }
+                  // Polling fallback for SPA navigations that replace document.body
+                  if (!window._tPoll) {
+                    window._tPoll = setInterval(function() {
+                      document.querySelectorAll('video,audio').forEach(_attach);
+                    }, 3000);
+                  }
+
+                  // ── 2. Blob download interceptor ──────────────────────────
+                  // The PWA uses URL.createObjectURL(blob) + a.click() to trigger
+                  // downloads. We intercept the click, convert blob → base64,
+                  // and pass it to the saveFileBytes native handler.
+                  if (!window._tBlobDl && window.flutter_inappwebview) {
+                    window._tBlobDl = true;
+                    document.addEventListener('click', function(e) {
+                      var a = e.target;
+                      for (var i = 0; i < 6 && a; i++) {
+                        if (a.tagName === 'A') break;
+                        a = a.parentElement;
+                      }
+                      if (!a || a.tagName !== 'A' || !a.hasAttribute('download')) return;
+                      var href = a.getAttribute('href') || '';
+                      if (!href.startsWith('blob:')) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      var fname = a.getAttribute('download') || 'download';
+                      fetch(href)
+                        .then(function(r) { return r.blob(); })
+                        .then(function(blob) {
+                          return new Promise(function(res, rej) {
+                            var fr = new FileReader();
+                            fr.onload  = function() { res(fr.result); };
+                            fr.onerror = rej;
+                            fr.readAsDataURL(blob);
+                          });
+                        })
+                        .then(function(dataUrl) {
+                          window.flutter_inappwebview.callHandler('saveFileBytes', {
+                            data: dataUrl, fileName: fname, mimeType: ''
+                          });
+                        })
+                        .catch(function(err) { console.warn('[Titan] blob DL:', err); });
+                    }, true);
+                  }
+
+                  // ── 3. Web Notification API override ─────────────────────
+                  // The PWA skips Web FCM in native mode but still expects
+                  // Notification.permission === 'granted'. We override the API
+                  // to (a) silently succeed so PWA doesn't crash, and (b) forward
+                  // any direct new Notification() calls to flutter_local_notifications.
+                  if (!window._tNotifDone) {
+                    window._tNotifDone = true;
+                    function TitanNotif(title, opts) {
+                      if (window.flutter_inappwebview) {
+                        window.flutter_inappwebview.callHandler('showNotification', {
+                          title: String(title || ''),
+                          body:  String((opts && opts.body)  || ''),
+                          icon:  String((opts && opts.icon)  || ''),
+                          tag:   String((opts && opts.tag)   || '')
+                        }).catch(function() {});
+                      }
+                      this.close   = function() {};
+                      this.onclick = null;
+                    }
+                    TitanNotif.permission = 'granted';
+                    TitanNotif.requestPermission = function(cb) {
+                      var p = Promise.resolve('granted');
+                      if (cb) p.then(cb);
+                      return p;
+                    };
+                    try {
+                      Object.defineProperty(window, 'Notification', {
+                        value: TitanNotif, writable: true, configurable: true
+                      });
+                    } catch (e) {}
+                  }
+                })();
+              """);
             }
           DART
 
-      # ── Step 5: Write main.dart part 2 (rest of class) ─────────────────────
-      - name: Write main.dart part 2 (methods & build)
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
+      # ── Step 4: main.dart part 2 ─────────────────────────────────────────────
+      - name: Write main.dart part 2 (methods, build, offline fix)
         env:
           APP_SLUG: ${{ env.APP_SLUG }}
         run: |
@@ -741,49 +753,34 @@ jobs:
               if (kEnableCamera) {
                 await [Permission.camera, Permission.microphone].request();
               }
-
               if (kEnableLocation) {
                 await Permission.locationWhenInUse.request();
               }
-
               if (kEnableStorage && Platform.isAndroid) {
                 final sdkInt = await _getSdkInt();
                 if (sdkInt >= 33) {
-                  await [
-                    Permission.photos,
-                    Permission.videos,
-                    Permission.audio,
-                  ].request();
+                  await [Permission.photos, Permission.videos, Permission.audio].request();
                 } else if (sdkInt >= 30) {
-                  final manageStatus = await Permission.manageExternalStorage.status;
-                  if (!manageStatus.isGranted) {
-                    await Permission.manageExternalStorage.request();
-                  }
+                  final s = await Permission.manageExternalStorage.status;
+                  if (!s.isGranted) await Permission.manageExternalStorage.request();
                 } else {
                   await Permission.storage.request();
                 }
               }
-
-              if (kEnableNotifications && Platform.isAndroid) {
+              // Always request notification permission (needed for Notification API override)
+              if (Platform.isAndroid) {
                 final sdkInt = await _getSdkInt();
                 if (sdkInt >= 33) {
-                  final status = await Permission.notification.status;
-                  if (status.isDenied) {
-                    await Permission.notification.request();
-                  } else if (status.isPermanentlyDenied) {
-                    await openAppSettings();
-                  }
+                  final s = await Permission.notification.status;
+                  if (s.isDenied)               await Permission.notification.request();
+                  else if (s.isPermanentlyDenied) await openAppSettings();
                 }
               }
             }
 
             Future<int> _getSdkInt() async {
-              try {
-                final info = await DeviceInfoPlugin().androidInfo;
-                return info.version.sdkInt;
-              } catch (_) {
-                return 33;
-              }
+              try { return (await DeviceInfoPlugin().androidInfo).version.sdkInt; }
+              catch (_) { return 33; }
             }
 
             Future<void> _checkConnectivity() async {
@@ -803,15 +800,42 @@ jobs:
               SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
             }
 
+            // FIX: Only use launchUrl for non-blob URLs.
+            // Blob URLs are handled by the JS click-interceptor → saveFileBytes.
             Future<void> _handleDownload(String url, String? suggestedFilename, String? mimeType) async {
-              final uri = Uri.parse(url);
+              if (url.startsWith('blob:')) {
+                // Inject JS to fetch blob → base64 → saveFileBytes handler
+                final safeName = (suggestedFilename ?? 'download').replaceAll("'", '_');
+                await _ctrl?.evaluateJavascript(source:
+                  'window._dlU=\'' + url + '\';window._dlN=\'' + safeName + '\';');
+                await _ctrl?.evaluateJavascript(source: r"""
+                  (function(){
+                    var u=window._dlU, n=window._dlN;
+                    if(!u||!window.flutter_inappwebview) return;
+                    fetch(u).then(function(r){return r.blob();})
+                      .then(function(b){return new Promise(function(res,rej){
+                        var fr=new FileReader();
+                        fr.onload=function(){res(fr.result);};
+                        fr.onerror=rej;
+                        fr.readAsDataURL(b);
+                      });})
+                      .then(function(d){
+                        window.flutter_inappwebview.callHandler('saveFileBytes',{data:d,fileName:n,mimeType:''});
+                      })
+                      .catch(function(e){console.warn('[Titan] blob fallback:',e);});
+                  })();
+                """);
+                return;
+              }
+              // Regular HTTPS → open in system browser / download manager
+              final uri = Uri.tryParse(url);
+              if (uri == null) return;
               try {
                 await launchUrl(uri, mode: LaunchMode.externalApplication);
               } catch (_) {
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('تعذّر فتح رابط التحميل')),
-                  );
+                    const SnackBar(content: Text('تعذّر فتح رابط التحميل')));
                 }
               }
             }
@@ -835,8 +859,7 @@ jobs:
                 child: Scaffold(
                   backgroundColor: Colors.black,
                   body: SafeArea(
-                    top: !_fullscreen,
-                    bottom: !_fullscreen,
+                    top: !_fullscreen, bottom: !_fullscreen,
                     child: Stack(children: [
 
                       InAppWebView(
@@ -844,78 +867,110 @@ jobs:
                         initialSettings: InAppWebViewSettings(
                           javaScriptEnabled: true,
                           javaScriptCanOpenWindowsAutomatically: true,
-                          domStorageEnabled: true,
-                          databaseEnabled: true,
-                          cacheEnabled: true,
-                          clearCache: false,
-                          allowFileAccessFromFileURLs: true,
+                          domStorageEnabled:  true,
+                          databaseEnabled:    true,
+                          cacheEnabled:       true,
+                          clearCache:         false,
+                          allowFileAccessFromFileURLs:      true,
                           allowUniversalAccessFromFileURLs: true,
-                          thirdPartyCookiesEnabled: true,
-                          userAgent: kUserAgent,
-                          useShouldOverrideUrlLoading: true,
-                          useOnDownloadStart: true,
-                          supportZoom: true,
-                          builtInZoomControls: false,
-                          displayZoomControls: false,
+                          thirdPartyCookiesEnabled:         true,
+                          userAgent:                        kUserAgent,
+                          useShouldOverrideUrlLoading:      true,
+                          useOnDownloadStart:               true,
+                          supportZoom:          true,
+                          builtInZoomControls:  false,
+                          displayZoomControls:  false,
                           supportMultipleWindows: true,
                           mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
-                          geolocationEnabled: kEnableLocation,
+                          geolocationEnabled:               kEnableLocation,
                           mediaPlaybackRequiresUserGesture: false,
-                          allowsInlineMediaPlayback: true,
-                          allowsAirPlayForMediaPlayback: true,
-                          transparentBackground: false,
+                          allowsInlineMediaPlayback:        true,
+                          allowsAirPlayForMediaPlayback:    true,
+                          transparentBackground:            false,
                         ),
 
-                        onWebViewCreated:  (c) => _ctrl = c,
-                        onLoadStart:       (c, url) { if (mounted) setState(() { _loading = true; _error = false; }); },
-                        onLoadStop:        (c, url) async {
-                          if (mounted) setState(() => _loading = false);
+                        onWebViewCreated: (c) => _ctrl = c,
+
+                        onLoadStart: (c, url) {
+                          if (mounted) setState(() { _loading = true; _error = false; });
+                        },
+
+                        // FIX: mark first successful load so offline overlay
+                        // won't block the PWA (service-worker handles offline)
+                        onLoadStop: (c, url) async {
+                          if (mounted) setState(() { _loading = false; _hasLoadedOnce = true; });
                           final p = await SharedPreferences.getInstance();
                           await p.setString('lastUrl', url?.toString() ?? kAppUrl);
                           _setupMediaBridge(c);
                         },
-                        onReceivedError:   (c, req, err) {
-                          if (req.isForMainFrame == true && mounted) setState(() { _loading = false; _error = true; });
+
+                        onReceivedError: (c, req, err) {
+                          if (req.isForMainFrame == true && mounted)
+                            setState(() { _loading = false; _error = true; });
                         },
+
                         onEnterFullscreen: (c) => _enterFullscreen(),
                         onExitFullscreen:  (c) => _exitFullscreen(),
-                        onPermissionRequest: (c, req) async => PermissionResponse(resources: req.resources, action: PermissionResponseAction.GRANT),
-                        onGeolocationPermissionsShowPrompt: (c, origin) async => GeolocationPermissionShowPromptResponse(origin: origin, allow: kEnableLocation, retain: true),
+
+                        onPermissionRequest: (c, req) async =>
+                          PermissionResponse(resources: req.resources, action: PermissionResponseAction.GRANT),
+
+                        onGeolocationPermissionsShowPrompt: (c, origin) async =>
+                          GeolocationPermissionShowPromptResponse(origin: origin, allow: kEnableLocation, retain: true),
+
                         shouldOverrideUrlLoading: (c, nav) async {
                           final uri = nav.request.url;
                           if (uri == null) return NavigationActionPolicy.ALLOW;
                           final s = uri.scheme.toLowerCase();
-                          if (s == 'http' || s == 'https') return NavigationActionPolicy.ALLOW;
-                          if (await canLaunchUrl(uri)) { await launchUrl(uri, mode: LaunchMode.externalApplication); return NavigationActionPolicy.CANCEL; }
+                          if (s == 'http' || s == 'https' || s == 'blob') return NavigationActionPolicy.ALLOW;
+                          if (await canLaunchUrl(uri)) {
+                            await launchUrl(uri, mode: LaunchMode.externalApplication);
+                            return NavigationActionPolicy.CANCEL;
+                          }
                           return NavigationActionPolicy.ALLOW;
                         },
+
                         onCreateWindow: (c, action) async {
                           showDialog(context: context, builder: (ctx) => AlertDialog(
                             contentPadding: EdgeInsets.zero,
                             content: SizedBox(
-                              width: MediaQuery.of(ctx).size.width,
+                              width:  MediaQuery.of(ctx).size.width,
                               height: MediaQuery.of(ctx).size.height * 0.85,
                               child: Column(children: [
-                                Align(alignment: Alignment.topRight, child: IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.pop(ctx))),
+                                Align(alignment: Alignment.topRight,
+                                  child: IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.pop(ctx))),
                                 Expanded(child: InAppWebView(
                                   windowId: action.windowId,
-                                  initialSettings: InAppWebViewSettings(javaScriptEnabled: true, thirdPartyCookiesEnabled: true, userAgent: kUserAgent),
-                                  onCloseWindow: (c) async { if (Navigator.canPop(ctx)) Navigator.pop(ctx); },
+                                  initialSettings: InAppWebViewSettings(
+                                    javaScriptEnabled: true,
+                                    thirdPartyCookiesEnabled: true,
+                                    userAgent: kUserAgent),
+                                  onCloseWindow: (c) async {
+                                    if (Navigator.canPop(ctx)) Navigator.pop(ctx);
+                                  },
                                 )),
                               ]),
                             ),
                           ));
                           return true;
                         },
+
+                        // FIX: blob: URLs are intercepted by the JS click listener above;
+                        // this is the safety net for any that still slip through
                         onDownloadStartRequest: (c, req) async {
                           await _handleDownload(req.url.toString(), req.suggestedFilename, req.mimeType);
                         },
                       ),
 
                       if (_loading && !_error)
-                        const Positioned(top: 0, left: 0, right: 0, child: LinearProgressIndicator(backgroundColor: Colors.transparent, color: Colors.blue, minHeight: 3)),
+                        const Positioned(top: 0, left: 0, right: 0,
+                          child: LinearProgressIndicator(
+                            backgroundColor: Colors.transparent,
+                            color: Colors.blue, minHeight: 3)),
 
-                      if (_offline)
+                      // FIX: Don't block the PWA with an offline overlay after the
+                      // first successful load — the service worker handles caching.
+                      if (_offline && !_hasLoadedOnce)
                         Container(color: Colors.white, child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
                           const Icon(Icons.wifi_off_rounded, size: 72, color: Color(0xFFE53935)),
                           const SizedBox(height: 16),
@@ -923,7 +978,10 @@ jobs:
                           const SizedBox(height: 8),
                           const Text('تحقق من الاتصال وحاول مجدداً', style: TextStyle(color: Color(0xFF757575))),
                           const SizedBox(height: 24),
-                          ElevatedButton.icon(onPressed: () { _checkConnectivity(); _ctrl?.reload(); }, icon: const Icon(Icons.refresh_rounded), label: const Text('إعادة المحاولة')),
+                          ElevatedButton.icon(
+                            onPressed: () { _checkConnectivity(); _ctrl?.reload(); },
+                            icon: const Icon(Icons.refresh_rounded),
+                            label: const Text('إعادة المحاولة')),
                         ]))),
 
                       if (_error && !_offline)
@@ -933,9 +991,15 @@ jobs:
                           const Text('تعذر تحميل الصفحة', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                           const SizedBox(height: 24),
                           Row(mainAxisSize: MainAxisSize.min, children: [
-                            ElevatedButton.icon(onPressed: () => _ctrl?.reload(), icon: const Icon(Icons.refresh_rounded), label: const Text('إعادة التحميل')),
+                            ElevatedButton.icon(
+                              onPressed: () => _ctrl?.reload(),
+                              icon: const Icon(Icons.refresh_rounded),
+                              label: const Text('إعادة التحميل')),
                             const SizedBox(width: 12),
-                            OutlinedButton.icon(onPressed: () => _ctrl?.loadUrl(urlRequest: URLRequest(url: WebUri(kAppUrl))), icon: const Icon(Icons.home_rounded), label: const Text('الرئيسية')),
+                            OutlinedButton.icon(
+                              onPressed: () => _ctrl?.loadUrl(urlRequest: URLRequest(url: WebUri(kAppUrl))),
+                              icon: const Icon(Icons.home_rounded),
+                              label: const Text('الرئيسية')),
                           ]),
                         ]))),
                     ]),
@@ -946,9 +1010,8 @@ jobs:
           }
           DART
 
-      # ── Step 6: MainActivity.kt with full features ──────────────────────────
-      - name: Inject MainActivity Kotlin (with video & download methods)
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
+      # ── Step 5: MainActivity.kt ───────────────────────────────────────────────
+      - name: Inject MainActivity Kotlin (saveToDownloads + getDeviceVideos)
         env:
           APP_SLUG: ${{ env.APP_SLUG }}
         run: |
@@ -995,9 +1058,7 @@ jobs:
                             put(MediaStore.Downloads.MIME_TYPE, mimeType)
                             put(MediaStore.Downloads.IS_PENDING, 1)
                           }
-                          val uri = contentResolver.insert(
-                            MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
-                          )
+                          val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                           if (uri != null) {
                             contentResolver.openOutputStream(uri)?.use { out ->
                               File(sourcePath).inputStream().use { it.copyTo(out) }
@@ -1010,15 +1071,11 @@ jobs:
                             result.error("MEDIA_STORE_FAIL", "Could not create MediaStore entry", null)
                           }
                         } else {
-                          val dlDir = Environment.getExternalStoragePublicDirectory(
-                            Environment.DIRECTORY_DOWNLOADS
-                          )
+                          val dlDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                           dlDir.mkdirs()
                           val dest = File(dlDir, fileName)
                           File(sourcePath).copyTo(dest, overwrite = true)
-                          MediaScannerConnection.scanFile(
-                            this, arrayOf(dest.absolutePath), arrayOf(mimeType), null
-                          )
+                          MediaScannerConnection.scanFile(this, arrayOf(dest.absolutePath), arrayOf(mimeType), null)
                           result.success("saved")
                         }
                       } catch (e: Exception) {
@@ -1029,14 +1086,10 @@ jobs:
                     "openDownloadsFolder" -> {
                       try {
                         val intent = Intent(Intent.ACTION_VIEW).apply {
-                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            data = MediaStore.Downloads.EXTERNAL_CONTENT_URI
-                          } else {
-                            val dlDir = Environment.getExternalStoragePublicDirectory(
-                              Environment.DIRECTORY_DOWNLOADS
-                            )
-                            data = Uri.fromFile(dlDir)
-                          }
+                          data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                            MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                          else
+                            Uri.fromFile(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS))
                           addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         }
                         startActivity(intent)
@@ -1048,21 +1101,18 @@ jobs:
 
                     "openExternalUrl" -> {
                       val url = call.argument<String>("url") ?: ""
-                      if (url.isEmpty()) {
-                        result.error("INVALID_URL", "URL is empty", null)
-                        return@setMethodCallHandler
-                      }
+                      if (url.isEmpty()) { result.error("INVALID_URL", "URL is empty", null); return@setMethodCallHandler }
                       try {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-                          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        startActivity(intent)
+                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
                         result.success("opened")
                       } catch (e: Exception) {
                         result.error("OPEN_ERROR", e.message ?: "Unknown error", null)
                       }
                     }
 
+                    // FIX: return filePath (DATA column) so _TitanVideoServer can
+                    // stream it via byte-range HTTP — content:// URIs are NOT
+                    // playable directly by the WebView's HTML5 video element.
                     "getDeviceVideos" -> {
                       try {
                         val videos = mutableListOf<Map<String, Any?>>()
@@ -1072,28 +1122,30 @@ jobs:
                           MediaStore.Video.Media.DURATION,
                           MediaStore.Video.Media.DATA
                         )
-                        val sortOrder = "${MediaStore.Video.Media.DATE_MODIFIED} DESC"
                         val cursor: Cursor? = contentResolver.query(
                           MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                          projection, null, null, sortOrder
+                          projection, null, null,
+                          "${MediaStore.Video.Media.DATE_MODIFIED} DESC"
                         )
                         cursor?.use { c ->
-                          val idCol    = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
-                          val nameCol  = c.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
-                          val durCol   = c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
-                          val dataCol  = c.getColumnIndexOrThrow(MediaStore.Video.Media.DATA)
+                          val idCol   = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                          val nameCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+                          val durCol  = c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
+                          val dataCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DATA)
                           while (c.moveToNext() && videos.size < 200) {
                             val id       = c.getLong(idCol)
                             val name     = c.getString(nameCol) ?: "Video"
                             val dur      = c.getLong(durCol) / 1000.0
                             val filePath = c.getString(dataCol) ?: ""
-                            val videoUri = Uri.withAppendedPath(
-                              MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id.toString()
-                            )
+                            if (filePath.isEmpty() || !File(filePath).exists()) continue
+
+                            // Thumbnail (best effort — empty string on failure is OK)
                             var thumbB64 = ""
                             try {
+                              val videoUri = Uri.withAppendedPath(
+                                MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id.toString())
                               val bmp: Bitmap? = if (Build.VERSION.SDK_INT >= 29) {
-                                contentResolver.loadThumbnail(videoUri, android.util.Size(96, 96), null)
+                                contentResolver.loadThumbnail(videoUri, android.util.Size(120, 120), null)
                               } else {
                                 @Suppress("DEPRECATION")
                                 ThumbnailUtils.createVideoThumbnail(filePath, MediaStore.Images.Thumbnails.MINI_KIND)
@@ -1108,7 +1160,7 @@ jobs:
                             } catch (_: Exception) {}
 
                             videos.add(mapOf(
-                              "url"       to videoUri.toString(),
+                              "filePath"  to filePath,              // ← Dart wraps in localhost URL
                               "title"     to name.substringBeforeLast('.'),
                               "duration"  to dur,
                               "thumbnail" to thumbB64
@@ -1130,211 +1182,127 @@ jobs:
 
           sed -i "s/APP_SLUG_PLACEHOLDER/$APP_SLUG/g" "$PKG_PATH/MainActivity.kt"
 
-      # ── Step 7: Replace placeholders ────────────────────────────────────────
+      # ── Step 6: Replace placeholders ─────────────────────────────────────────
       - name: Replace Template Variables
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
-          APP_URL="${{ github.event.inputs.app_url }}"
-          APP_NAME="${{ github.event.inputs.app_name }}"
-          LOC="${{ github.event.inputs.enable_location }}"
-          NOTIF="${{ github.event.inputs.enable_notifications }}"
-          CAM="${{ github.event.inputs.enable_camera }}"
-          STOR="${{ github.event.inputs.enable_storage }}"
+          URL_ESCAPED=$(printf '%s' "${{ github.event.inputs.app_url }}" | sed 's/|/\|/g')
+          sed -i "s|PLACEHOLDER_URL|$URL_ESCAPED|g"                         "$APP_SLUG/lib/main.dart"
+          sed -i "s|PLACEHOLDER_NAME|${{ github.event.inputs.app_name }}|g" "$APP_SLUG/lib/main.dart"
+          sed -i "s|PLACEHOLDER_LOCATION|${{ github.event.inputs.enable_location }}|g"      "$APP_SLUG/lib/main.dart"
+          sed -i "s|PLACEHOLDER_NOTIFICATIONS|${{ github.event.inputs.enable_notifications }}|g" "$APP_SLUG/lib/main.dart"
+          sed -i "s|PLACEHOLDER_CAMERA|${{ github.event.inputs.enable_camera }}|g"          "$APP_SLUG/lib/main.dart"
+          sed -i "s|PLACEHOLDER_STORAGE|${{ github.event.inputs.enable_storage }}|g"        "$APP_SLUG/lib/main.dart"
 
-          URL_ESCAPED=$(printf '%s' "$APP_URL" | sed 's/|/\|/g')
-
-          sed -i "s|PLACEHOLDER_URL|$URL_ESCAPED|g"           "$APP_SLUG/lib/main.dart"
-          sed -i "s|PLACEHOLDER_NAME|$APP_NAME|g"             "$APP_SLUG/lib/main.dart"
-          sed -i "s|PLACEHOLDER_LOCATION|$LOC|g"              "$APP_SLUG/lib/main.dart"
-          sed -i "s|PLACEHOLDER_NOTIFICATIONS|$NOTIF|g"       "$APP_SLUG/lib/main.dart"
-          sed -i "s|PLACEHOLDER_CAMERA|$CAM|g"                "$APP_SLUG/lib/main.dart"
-          sed -i "s|PLACEHOLDER_STORAGE|$STOR|g"              "$APP_SLUG/lib/main.dart"
-
-      # ── Step 8: App Icon handling ───────────────────────────────────────────
+      # ── Step 7: App Icon ──────────────────────────────────────────────────────
       - name: Handle App Icon
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
           ICON_URL="${{ github.event.inputs.icon_url }}"
-
           if [ -n "$ICON_URL" ] && [ "$ICON_URL" != "" ]; then
             curl -L -o /tmp/app_icon.png "$ICON_URL" 2>/dev/null || true
             if [ -f /tmp/app_icon.png ] && [ -s /tmp/app_icon.png ]; then
               sudo apt-get install -y imagemagick 2>/dev/null | tail -1
               for size in 48 72 96 144 192; do
                 case $size in
-                  48)  dir="mipmap-mdpi"    ;;
-                  72)  dir="mipmap-hdpi"    ;;
-                  96)  dir="mipmap-xhdpi"   ;;
-                  144) dir="mipmap-xxhdpi"  ;;
+                  48) dir="mipmap-mdpi" ;; 72) dir="mipmap-hdpi" ;;
+                  96) dir="mipmap-xhdpi" ;; 144) dir="mipmap-xxhdpi" ;;
                   192) dir="mipmap-xxxhdpi" ;;
                 esac
                 mkdir -p "$APP_SLUG/android/app/src/main/res/$dir"
-                convert /tmp/app_icon.png -resize ${size}x${size} \
-                  "$APP_SLUG/android/app/src/main/res/$dir/ic_launcher.png" 2>/dev/null || true
-                convert /tmp/app_icon.png -resize ${size}x${size} -alpha on \
-                  "$APP_SLUG/android/app/src/main/res/$dir/ic_launcher_round.png" 2>/dev/null || true
+                convert /tmp/app_icon.png -resize ${size}x${size} "$APP_SLUG/android/app/src/main/res/$dir/ic_launcher.png" 2>/dev/null || true
+                convert /tmp/app_icon.png -resize ${size}x${size} -alpha on "$APP_SLUG/android/app/src/main/res/$dir/ic_launcher_round.png" 2>/dev/null || true
               done
               echo "✅ Icon applied"
             fi
           fi
 
-      # ── Step 9: Patch ProGuard ──────────────────────────────────────────────
+      # ── Step 8: Patch ProGuard ────────────────────────────────────────────────
       - name: Patch ProGuard
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           find ~/.pub-cache/hosted/pub.dev/ -name "build.gradle" \
             -print0 | xargs -0 sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" 2>/dev/null || true
 
-      # ── Step 10: Build APK ──────────────────────────────────────────────────
+      # ── Step 9: Build APK ─────────────────────────────────────────────────────
       - name: Build APK
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           cd "${{ env.APP_SLUG }}"
           flutter build apk --release
 
-      # ── Step 11: Build AAB ──────────────────────────────────────────────────
+      # ── Step 10: Build AAB ────────────────────────────────────────────────────
       - name: Build AAB
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           cd "${{ env.APP_SLUG }}"
           flutter build appbundle --release
 
-      # ── Step 12: Generate Keystore & Sign ───────────────────────────────────
+      # ── Step 11: Generate Keystore & Sign ─────────────────────────────────────
       - name: Generate Keystore and Sign APK
-        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
-          APP_NAME="${{ github.event.inputs.app_name }}"
           TRACKING="${{ github.event.inputs.tracking_id }}"
-
           ALIAS="titan-$(echo $TRACKING | cut -c1-8)"
           KS_PASS="$(openssl rand -hex 16)"
           KEY_PASS="$KS_PASS"
-
-          keytool -genkey -v \
-            -keystore /tmp/release.jks \
-            -storetype PKCS12 \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -alias "$ALIAS" \
-            -storepass "$KS_PASS" \
-            -dname "CN=$APP_NAME, OU=App, O=Titan, L=City, S=State, C=US"
-
+          keytool -genkey -v -keystore /tmp/release.jks -storetype PKCS12 \
+            -keyalg RSA -keysize 2048 -validity 10000 -alias "$ALIAS" \
+            -storepass "$KS_PASS" -dname "CN=${{ github.event.inputs.app_name }}, OU=App, O=Titan, L=City, S=State, C=US"
           BUILD_TOOLS=$(ls -d $ANDROID_SDK_ROOT/build-tools/* | tail -1)
-
-          $BUILD_TOOLS/apksigner sign \
-            --ks /tmp/release.jks \
-            --ks-key-alias "$ALIAS" \
-            --ks-pass "pass:$KS_PASS" \
-            --key-pass "pass:$KEY_PASS" \
+          $BUILD_TOOLS/apksigner sign --ks /tmp/release.jks --ks-key-alias "$ALIAS" \
+            --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
             "$APP_SLUG/build/app/outputs/flutter-apk/app-release.apk"
-
-          echo "KEY_ALIAS=$ALIAS"   >> $GITHUB_ENV
-          echo "KS_PASS=$KS_PASS"   >> $GITHUB_ENV
-          echo "KEY_PASS=$KEY_PASS"  >> $GITHUB_ENV
+          echo "KEY_ALIAS=$ALIAS"  >> $GITHUB_ENV
+          echo "KS_PASS=$KS_PASS"  >> $GITHUB_ENV
+          echo "KEY_PASS=$KEY_PASS" >> $GITHUB_ENV
           cp /tmp/release.jks /tmp/release-keystore.jks
 
-      # ── Step 13: Create Release Package ─────────────────────────────────────
+      # ── Step 12: Create Release Package ───────────────────────────────────────
       - name: Create Release Package
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
-          APP_NAME="${{ github.event.inputs.app_name }}"
-          APP_URL="${{ github.event.inputs.app_url }}"
           TRACKING="${{ github.event.inputs.tracking_id }}"
-          ALIAS="${{ env.KEY_ALIAS }}"
-          KS_PASS="${{ env.KS_PASS }}"
-          KEY_PASS="${{ env.KEY_PASS }}"
-          BUILD_DATE=$(date '+%Y-%m-%d %H:%M UTC')
-
           mkdir -p /tmp/release-package
-          BUILD_TYPE="${{ env.BUILD_TYPE }}"
-          if [ "$BUILD_TYPE" = "pwa_twa" ] || [ "$BUILD_TYPE" = "twa_native" ]; then
-            TWA_APK="${{ env.TWA_APK }}"
-            TWA_AAB="${{ env.TWA_AAB }}"
-            [ -n "$TWA_APK" ] && [ -f "$TWA_APK" ] && cp "$TWA_APK" "/tmp/release-package/${APP_SLUG}-twa-release.apk" || echo "⚠️ TWA APK not found"
-            [ -n "$TWA_AAB" ] && [ -f "$TWA_AAB" ] && cp "$TWA_AAB" "/tmp/release-package/${APP_SLUG}-twa-release.aab" || echo "ℹ️ TWA AAB not built"
-            cp /tmp/twa-project/android.keystore "/tmp/release-package/release-keystore.jks" 2>/dev/null || true
-            BUILD_LABEL="TWA (Trusted Web Activity — Chrome Engine)"
-          else
-            cp "$APP_SLUG/build/app/outputs/flutter-apk/app-release.apk" "/tmp/release-package/${APP_SLUG}-release.apk" 2>/dev/null || true
-            cp "$APP_SLUG/build/app/outputs/bundle/release/app-release.aab" "/tmp/release-package/${APP_SLUG}-release.aab" 2>/dev/null || true
-            cp /tmp/release-keystore.jks "/tmp/release-package/release-keystore.jks" 2>/dev/null || true
-            BUILD_LABEL="WebView (Flutter Engine)"
-          fi
-
+          cp "$APP_SLUG/build/app/outputs/flutter-apk/app-release.apk"       "/tmp/release-package/${APP_SLUG}-release.apk"
+          cp "$APP_SLUG/build/app/outputs/bundle/release/app-release.aab"    "/tmp/release-package/${APP_SLUG}-release.aab"
+          cp /tmp/release-keystore.jks "/tmp/release-package/release-keystore.jks"
           cat > "/tmp/release-package/README.txt" << 'README'
-          ╔══════════════════════════════════════════════════╗
-          ║         TITAN WEBVIEW APP — RELEASE PACKAGE      ║
-          ╚══════════════════════════════════════════════════╝
-
-          App Name   : $APP_NAME
-          App URL    : $APP_URL
-          Build Date : $BUILD_DATE
-          Tracking ID: $TRACKING
-          Build Type : $BUILD_LABEL
-
-          ── FILES ──────────────────────────────────────────
-          ${APP_SLUG}-release.apk  → Install directly on Android
-          ${APP_SLUG}-release.aab  → Upload to Google Play Store
-          release-keystore.jks     → Keep this safe! Needed for future updates.
-
-          ── KEYSTORE INFO (KEEP PRIVATE!) ──────────────────
-          Key Alias      : $ALIAS
-          Store Password : $KS_PASS
-          Key Password   : $KEY_PASS
+          Titan WebView App — Release Package
+          Key Alias : ${{ env.KEY_ALIAS }}
+          KS Pass   : ${{ env.KS_PASS }}
+          Key Pass  : ${{ env.KEY_PASS }}
           README
-
-          cd /tmp
-          zip -r "release-package-${TRACKING}.zip" release-package/
+          cd /tmp && zip -r "release-package-${TRACKING}.zip" release-package/
           echo "RELEASE_ZIP=/tmp/release-package-${TRACKING}.zip" >> $GITHUB_ENV
 
-      # ── Step 14: Upload to HF Dataset CDN ───────────────────────────────────
+      # ── Step 13: Upload to HF Dataset ────────────────────────────────────────
       - name: Upload Release Package to HF Dataset
         env:
-          TRACKING: ${{ github.event.inputs.tracking_id }}
-          HF_TOKEN: ${{ github.event.inputs.hf_token }}
-          HF_DATASET: ${{ github.event.inputs.hf_dataset }}
+          TRACKING:    ${{ github.event.inputs.tracking_id }}
+          HF_TOKEN:    ${{ github.event.inputs.hf_token }}
+          HF_DATASET:  ${{ github.event.inputs.hf_dataset }}
           RELEASE_ZIP: /tmp/release-package-${{ github.event.inputs.tracking_id }}.zip
         run: |
           pip install huggingface_hub -q
-
           DOWNLOAD_URL=$(python3 - << 'PYEOF'
           import sys, os
           from huggingface_hub import HfApi
-
           api = HfApi()
-          tracking = os.environ.get("TRACKING")
-          hf_dataset = os.environ.get("HF_DATASET")
-          hf_token = os.environ.get("HF_TOKEN")
-          release_zip = os.environ.get("RELEASE_ZIP")
-
-          path_in_repo = f"builds/{tracking}/release-package.zip"
-
+          path = f"builds/{os.environ['TRACKING']}/release-package.zip"
           try:
-              url = api.upload_file(
-                  path_or_fileobj=release_zip,
-                  path_in_repo=path_in_repo,
-                  repo_id=hf_dataset,
-                  repo_type="dataset",
-                  token=hf_token,
-              )
-              print(f"https://huggingface.co/{hf_dataset}/resolve/main/{path_in_repo}")
+              api.upload_file(path_or_fileobj=os.environ['RELEASE_ZIP'], path_in_repo=path,
+                              repo_id=os.environ['HF_DATASET'], repo_type="dataset", token=os.environ['HF_TOKEN'])
+              print(f"https://huggingface.co/{os.environ['HF_DATASET']}/resolve/main/{path}")
           except Exception as e:
-              sys.stderr.write(f"HF upload error: {e}\n")
-              print("")
+              sys.stderr.write(f"HF upload error: {e}\n"); print("")
           PYEOF
           )
-
           if [ -n "$DOWNLOAD_URL" ]; then
             echo "HF_DOWNLOAD_URL=$DOWNLOAD_URL" >> $GITHUB_ENV
             echo "✅ Uploaded: $DOWNLOAD_URL"
           else
-            echo "❌ HF upload failed"
-            echo "HF_DOWNLOAD_URL=" >> $GITHUB_ENV
+            echo "❌ HF upload failed"; echo "HF_DOWNLOAD_URL=" >> $GITHUB_ENV
           fi
 
-      # ── Step 15: Upload GitHub Artifact ─────────────────────────────────────
+      # ── Step 14: Upload GitHub Artifact ──────────────────────────────────────
       - name: Upload GitHub Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -1342,17 +1310,13 @@ jobs:
           path: /tmp/release-package-${{ github.event.inputs.tracking_id }}.zip
           retention-days: 30
 
-      # ── Step 16: Webhook callback ───────────────────────────────────────────
+      # ── Step 15: Webhook callback ─────────────────────────────────────────────
       - name: Send webhook callback
         if: always()
         run: |
           STATUS="success"
           if [ "${{ job.status }}" != "success" ]; then STATUS="failure"; fi
-
-          DOWNLOAD_URL="${{ env.HF_DOWNLOAD_URL }}"
-          TRACKING="${{ github.event.inputs.tracking_id }}"
-
-          curl -s -X POST "${{ github.event.inputs.webhook_url }}?tracking_id=${TRACKING}" \
+          curl -s -X POST "${{ github.event.inputs.webhook_url }}?tracking_id=${{ github.event.inputs.tracking_id }}" \
             -H "Content-Type: application/json" \
             -H "x-github-event: workflow_run" \
             -d "{
@@ -1363,7 +1327,7 @@ jobs:
                 \"html_url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
                 \"artifacts_url\": \"${{ github.api_url }}/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts\",
                 \"head_branch\": \"main\",
-                \"hf_download_url\": \"$DOWNLOAD_URL\"
+                \"hf_download_url\": \"${{ env.HF_DOWNLOAD_URL }}\"
               },
               \"repository\": { \"full_name\": \"${{ github.repository }}\" }
             }"
