@@ -1081,7 +1081,6 @@ jobs:
           DART
 
       - name: Inject MainActivity Kotlin (with video & download methods)
-      - name: Inject MainActivity Kotlin (with video & download methods)
         if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         env:
           APP_SLUG: ${{ env.APP_SLUG }}
