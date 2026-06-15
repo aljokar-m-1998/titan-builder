@@ -120,7 +120,7 @@ jobs:
           except Exception as e:
             print(f'⚠️ manifest parse error: {e}')
             with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write(f'MANIFEST_NAME={os.environ.get("APP_NAME","App")}\n')
+              f.write(f'MANIFEST_NAME={os.environ.get(\"APP_NAME\",\"App\")}\n')
           " || true
 
           APP_SLUG=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
@@ -190,7 +190,13 @@ jobs:
           echo "KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
           echo "KEY_PASS=$KEY_PASS"  >> $GITHUB_ENV
 
-          keytool -genkey -v             -keystore /tmp/twa-project/android.keystore             -keyalg RSA -keysize 2048 -validity 10000             -alias "$KEY_ALIAS"             -storepass "$KS_PASS"             -keypass "$KEY_PASS"             -dname "CN=$APP_NAME, OU=App, O=Titan, L=City, S=State, C=US"
+          keytool -genkey -v \
+            -keystore /tmp/twa-project/android.keystore \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias "$KEY_ALIAS" \
+            -storepass "$KS_PASS" \
+            -keypass "$KEY_PASS" \
+            -dname "CN=$APP_NAME, OU=App, O=Titan, L=City, S=State, C=US"
 
           # Init and build via bubblewrap
           cd /tmp/twa-project
@@ -218,7 +224,12 @@ jobs:
           APK=$(find /tmp/twa-project -name "*.apk" | head -1)
           if [ -n "$APK" ] && [ -f "$APK" ]; then
             BUILD_TOOLS=$(ls -d $ANDROID_SDK_ROOT/build-tools/* | tail -1)
-            $BUILD_TOOLS/apksigner sign               --ks /tmp/twa-project/android.keystore               --ks-key-alias "$KEY_ALIAS"               --ks-pass "pass:$KS_PASS"               --key-pass "pass:$KEY_PASS"               "$APK" 2>/dev/null || true
+            $BUILD_TOOLS/apksigner sign \
+              --ks /tmp/twa-project/android.keystore \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass "pass:$KS_PASS" \
+              --key-pass "pass:$KEY_PASS" \
+              "$APK" 2>/dev/null || true
             echo "TWA_APK=$APK" >> $GITHUB_ENV
             echo "✅ TWA APK ready: $APK"
           else
@@ -241,7 +252,8 @@ jobs:
           flutter create --platforms=android --project-name "$APP_SLUG" --org com.titan "$APP_SLUG"
 
           cd "$APP_SLUG"
-          flutter pub add flutter_inappwebview connectivity_plus permission_handler url_launcher shared_preferences path_provider device_info_plus just_audio audio_service
+          # ✅ FIX: أضفنا dio (تحميل HTTPS) — flutter_local_notifications مش محتاجه لأن الـ Kotlin بيعمل الإشعارات native
+          flutter pub add flutter_inappwebview connectivity_plus permission_handler url_launcher shared_preferences path_provider device_info_plus just_audio audio_service dio
 
           # Enable Core Library Desugaring + minSdk
           GRADLE=$(find android/app -maxdepth 1 -name "build.gradle*" | head -1)
@@ -296,12 +308,12 @@ jobs:
           MANIFEST="$APP_SLUG/android/app/src/main/AndroidManifest.xml"
 
           python3 - "$MANIFEST" << 'PYEOF'
-          import sys, os
+          import sys, os, re
           filepath = sys.argv[1]
           with open(filepath, 'r') as f:
               content = f.read()
 
-          # POST_NOTIFICATIONS & VIBRATE always present (needed for Notification API override)
+          # ✅ FIX: أضفنا الصلاحيات المفقودة للـ overlay وشاشة القفل والإشعارات المجدولة
           permissions = [
               "android.permission.INTERNET",
               "android.permission.ACCESS_NETWORK_STATE",
@@ -314,6 +326,12 @@ jobs:
               "android.permission.MANAGE_EXTERNAL_STORAGE",
               "android.permission.POST_NOTIFICATIONS",
               "android.permission.VIBRATE",
+              "android.permission.RECEIVE_BOOT_COMPLETED",
+              "android.permission.SCHEDULE_EXACT_ALARM",
+              "android.permission.USE_EXACT_ALARM",
+              "android.permission.SYSTEM_ALERT_WINDOW",
+              "android.permission.USE_FULL_SCREEN_INTENT",
+              "android.permission.DISABLE_KEYGUARD",
           ]
 
           if os.environ.get("ENABLE_CAMERA") == "true":
@@ -347,7 +365,7 @@ jobs:
                   "android.permission.VIBRATE",
               ])
 
-          perms_xml = '\n'.join([f'    <uses-permission android:name="{p}"/>' for p in permissions])
+          perms_xml = '\n'.join([f'    <uses-permission android:name="{p}"/>' for p in dict.fromkeys(permissions)])
 
           content = content.replace(
               '<application',
@@ -357,6 +375,13 @@ jobs:
 
           app_name = os.environ.get("APP_NAME", "Flutter App")
           content = content.replace('android:label="flutter_app"', f'android:label="{app_name}"')
+
+          # ✅ FIX: نضيف showWhenLocked و turnScreenOn للـ Activity عشان يشتغل على شاشة القفل
+          content = re.sub(
+              r'(<activity\b(?![^>]*showWhenLocked))',
+              r'\1 android:showWhenLocked="true" android:turnScreenOn="true"',
+              content, count=1
+          )
 
           audio_service = '''
                   <service android:name="com.ryanheise.audioservice.AudioService"
@@ -408,7 +433,7 @@ jobs:
           </paths>
           XML
 
-      # ── Step 4: Write main.dart (part 1/3) ─────────────────────────────────
+      # ── Step 4: Write main.dart (part 1/2) ─────────────────────────────────
       - name: Write main.dart part 1 (imports, VideoServer, AudioHandler, handlers)
         if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         env:
@@ -429,6 +454,7 @@ jobs:
           import 'package:device_info_plus/device_info_plus.dart';
           import 'package:audio_service/audio_service.dart';
           import 'package:just_audio/just_audio.dart';
+          import 'package:dio/dio.dart';
 
           const String kAppUrl  = 'PLACEHOLDER_URL';
           const String kAppName = 'PLACEHOLDER_NAME';
@@ -456,6 +482,8 @@ jobs:
               case 'aac':  return 'audio/aac';
               case 'ogg':  return 'audio/ogg';
               case 'pdf':  return 'application/pdf';
+              case 'zip':  return 'application/zip';
+              case 'apk':  return 'application/vnd.android.package-archive';
               default:     return 'application/octet-stream';
             }
           }
@@ -463,8 +491,6 @@ jobs:
           // ═══════════════════════════════════════════════════════════════════
           // Local HTTP server — streams device video files with byte-range
           // support so the HTML5 <video> element can seek properly.
-          // The PWA's CinemaManager expects http://127.0.0.1:PORT/... URLs,
-          // NOT content:// URIs (which the WebView cannot play directly).
           // ═══════════════════════════════════════════════════════════════════
           class _TitanVideoServer {
             static HttpServer? _srv;
@@ -528,8 +554,9 @@ jobs:
               return 'video/mp4';
             }
 
+            // ✅ FIX: أزلنا \$ اللي كان بيعطل الـ interpolation في single-quoted heredoc
             static String urlFor(String filePath) =>
-                'http://127.0.0.1:$_port/\${Uri.encodeComponent(filePath)}';
+                'http://127.0.0.1:$_port/${Uri.encodeComponent(filePath)}';
           }
 
           class TitanAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
@@ -547,7 +574,8 @@ jobs:
               Uri? art;
               if (artUrl.isNotEmpty) { try { art = Uri.parse(artUrl); } catch (_) {} }
               mediaItem.add(MediaItem(
-                id:      'webview_media_\${DateTime.now().millisecondsSinceEpoch}',
+                // ✅ FIX: أزلنا \$ عشان يشتغل Dart string interpolation صح
+                id:      'webview_media_${DateTime.now().millisecondsSinceEpoch}',
                 title:   title.isNotEmpty ? title : kAppName,
                 album:   kAppName, artUri: art, playable: true));
               if (playbackState.value.processingState == AudioProcessingState.idle) {
@@ -617,7 +645,7 @@ jobs:
             bool _offline       = false;
             bool _error         = false;
             bool _fullscreen    = false;
-            bool _hasLoadedOnce = false; // PWA service-worker offline fix
+            bool _hasLoadedOnce = false;
 
             @override
             void initState() {
@@ -633,9 +661,10 @@ jobs:
               });
             }
 
+            // ✅ FIX: أزلنا \$ عشان يشتغل Dart string interpolation صح — كان بيعمل مسار غلط
             Future<String> _writeTempFile(List<int> bytes, String name) async {
               final dir  = await getTemporaryDirectory();
-              final file = File('\${dir.path}/$name');
+              final file = File('${dir.path}/$name');
               await file.writeAsBytes(bytes, flush: true);
               return file.path;
             }
@@ -663,8 +692,9 @@ jobs:
                   try {
                     final data     = args[0] as Map<String, dynamic>;
                     final b64      = data['data']     as String? ?? '';
+                    // ✅ FIX: أزلنا \$ عشان يشتغل Dart string interpolation صح
                     final fileName = data['fileName'] as String?
-                        ?? 'Titan_\${DateTime.now().millisecondsSinceEpoch}.jpg';
+                        ?? 'Titan_${DateTime.now().millisecondsSinceEpoch}.jpg';
                     if (b64.isEmpty) return 'error';
                     final raw   = b64.contains(',') ? b64.split(',').last : b64;
                     final bytes = base64Decode(raw);
@@ -683,8 +713,9 @@ jobs:
                   try {
                     final data     = args[0] as Map<String, dynamic>;
                     final b64      = data['data']     as String? ?? '';
+                    // ✅ FIX: أزلنا \$ عشان يشتغل Dart string interpolation صح
                     final fileName = data['fileName'] as String?
-                        ?? 'Titan_\${DateTime.now().millisecondsSinceEpoch}';
+                        ?? 'Titan_${DateTime.now().millisecondsSinceEpoch}';
                     final mimeType = data['mimeType'] as String? ?? _guessMime(fileName);
                     if (b64.isEmpty) return 'error';
                     final raw   = b64.contains(',') ? b64.split(',').last : b64;
@@ -710,12 +741,19 @@ jobs:
                 },
               );
 
-              // Web Notification API — silently grant permission so PWA doesn't crash.
-              // Media notifications are handled by AudioService above.
-              // Full push notifications require Firebase Flutter SDK setup.
+              // ✅ FIX: كان intentional no-op — دلوقتي بيبعت للـ Kotlin عشان يعرض الإشعار فعلياً
               ctrl.addJavaScriptHandler(
                 handlerName: 'showNotification',
-                callback: (args) async { /* intentional no-op */ },
+                callback: (args) async {
+                  if (args.isEmpty) return;
+                  try {
+                    final data  = args[0] as Map<String, dynamic>;
+                    final title = data['title'] as String? ?? kAppName;
+                    final body  = data['body']  as String? ?? '';
+                    const ch = MethodChannel('titan_download');
+                    await ch.invokeMethod('showNotification', {'title': title, 'body': body});
+                  } catch (e) { debugPrint('showNotification: $e'); }
+                },
               );
 
               // Cinema: file paths → localhost streaming URLs
@@ -836,6 +874,7 @@ jobs:
             }
           DART
 
+      # ── Step 5: Write main.dart (part 2/2) ─────────────────────────────────
       - name: Write main.dart part 2 (methods & build)
         if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         env:
@@ -861,7 +900,7 @@ jobs:
                   await Permission.storage.request();
                 }
               }
-              // Always request notification permission (needed for Notification API override)
+              // Always request notification permission
               if (Platform.isAndroid) {
                 final sdkInt = await _getSdkInt();
                 if (sdkInt >= 33) {
@@ -869,6 +908,14 @@ jobs:
                   if (s.isDenied)               await Permission.notification.request();
                   else if (s.isPermanentlyDenied) await openAppSettings();
                 }
+              }
+              // ✅ FIX: طلب إذن الـ overlay (الظهور فوق التطبيقات) — صلاحية خاصة تحتاج Settings
+              if (Platform.isAndroid) {
+                try {
+                  const ch = MethodChannel('titan_download');
+                  final granted = await ch.invokeMethod<bool>('checkOverlayPermission') ?? false;
+                  if (!granted) await ch.invokeMethod('requestOverlayPermission');
+                } catch (e) { debugPrint('overlay perm: $e'); }
               }
             }
 
@@ -894,8 +941,8 @@ jobs:
               SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
             }
 
-            // blob: → JS bridge → saveFileBytes handler
-            // regular HTTPS → launchUrl (system download manager)
+            // ✅ FIX الرئيسي: blob → JS bridge (unchanged)
+            //    HTTPS → Dio download → saveToDownloads (كان launchUrl وبيفشل)
             Future<void> _handleDownload(String url, String? suggestedFilename, String? mimeType) async {
               if (url.startsWith('blob:')) {
                 final safeName = (suggestedFilename ?? 'download').replaceAll("'", '_');
@@ -918,13 +965,58 @@ jobs:
                 """);
                 return;
               }
+
               final uri = Uri.tryParse(url);
               if (uri == null) return;
+
+              // استخراج اسم الملف من الـ URL أو من الـ suggestedFilename
+              String fileName = suggestedFilename ?? '';
+              if (fileName.isEmpty) {
+                final seg = url.split('/').last.split('?').first;
+                // ✅ FIX: بدون \$ عشان يشتغل Dart string interpolation في single-quoted heredoc
+                fileName = seg.isNotEmpty ? seg : 'download_${DateTime.now().millisecondsSinceEpoch}';
+              }
+              final safeMime = (mimeType?.isNotEmpty == true) ? mimeType! : _guessMime(fileName);
+
+              // نعرض رسالة "جاري التحميل"
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  content: Text('⏬ جاري تحميل $fileName...'),
+                  duration: const Duration(seconds: 30)));
+              }
+
               try {
-                await launchUrl(uri, mode: LaunchMode.externalApplication);
-              } catch (_) {
-                if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('تعذّر فتح رابط التحميل')));
+                // نحمل الملف بـ Dio للـ temp folder
+                final tmpDir  = await getTemporaryDirectory();
+                // ✅ FIX: بدون \$ عشان يشتغل Dart string interpolation
+                final tmpPath = '${tmpDir.path}/$fileName';
+                await Dio().download(url, tmpPath);
+
+                // نحفظ من الـ temp للـ Downloads عبر الـ Kotlin channel
+                const ch = MethodChannel('titan_download');
+                final ok = await ch.invokeMethod<String>('saveToDownloads', {
+                  'sourcePath': tmpPath,
+                  'fileName':   fileName,
+                  'mimeType':   safeMime,
+                });
+                if (mounted) {
+                  ScaffoldMessenger.of(context).clearSnackBars();
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Text(ok == 'saved' ? '✅ تم الحفظ: $fileName' : '❌ فشل حفظ الملف'),
+                    duration: const Duration(seconds: 3)));
+                }
+              } catch (e) {
+                debugPrint('_handleDownload error: $e');
+                // Fallback: حاول تفتح في الـ browser
+                try {
+                  await launchUrl(uri, mode: LaunchMode.externalApplication);
+                } catch (_) {
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).clearSnackBars();
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('❌ تعذّر تحميل الملف')));
+                  }
+                }
               }
             }
 
@@ -977,7 +1069,6 @@ jobs:
                         onLoadStart: (c, url) {
                           if (mounted) setState(() { _loading = true; _error = false; });
                         },
-                        // Mark first successful load → PWA SW handles offline after this
                         onLoadStop: (c, url) async {
                           if (mounted) setState(() { _loading = false; _hasLoadedOnce = true; });
                           final p = await SharedPreferences.getInstance();
@@ -1027,7 +1118,6 @@ jobs:
                           ));
                           return true;
                         },
-                        // Safety net for blob: URLs not caught by the JS click interceptor
                         onDownloadStartRequest: (c, req) async {
                           await _handleDownload(req.url.toString(), req.suggestedFilename, req.mimeType);
                         },
@@ -1038,8 +1128,6 @@ jobs:
                           child: LinearProgressIndicator(
                             backgroundColor: Colors.transparent, color: Colors.blue, minHeight: 3)),
 
-                      // Only block with offline screen BEFORE first load.
-                      // After that, the PWA service-worker handles caching.
                       if (_offline && !_hasLoadedOnce)
                         Container(color: Colors.white, child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
                           const Icon(Icons.wifi_off_rounded, size: 72, color: Color(0xFFE53935)),
@@ -1080,7 +1168,8 @@ jobs:
           }
           DART
 
-      - name: Inject MainActivity Kotlin (with video & download methods)
+      # ── Step 6: Inject MainActivity Kotlin ─────────────────────────────────
+      - name: Inject MainActivity Kotlin (notifications, overlay, video & download)
         if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         env:
           APP_SLUG: ${{ env.APP_SLUG }}
@@ -1091,7 +1180,11 @@ jobs:
           cat > "$PKG_PATH/MainActivity.kt" << 'KOTLIN'
           package com.titan.APP_SLUG_PLACEHOLDER
 
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
           import android.content.ContentValues
+          import android.content.Context
           import android.content.Intent
           import android.database.Cursor
           import android.graphics.Bitmap
@@ -1099,9 +1192,12 @@ jobs:
           import android.media.ThumbnailUtils
           import android.net.Uri
           import android.os.Build
+          import android.os.Bundle
           import android.os.Environment
           import android.provider.MediaStore
+          import android.provider.Settings
           import android.util.Base64
+          import androidx.core.app.NotificationCompat
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.MethodChannel
@@ -1109,7 +1205,30 @@ jobs:
           import java.io.File
 
           class MainActivity : FlutterActivity() {
-            private val CHANNEL = "titan_download"
+            private val CHANNEL        = "titan_download"
+            private val NOTIF_CHANNEL  = "titan_channel"
+
+            // ✅ FIX: نسجل الـ notification channel لما التطبيق يفتح (لازم قبل أي إشعار)
+            override fun onCreate(savedInstanceState: Bundle?) {
+              super.onCreate(savedInstanceState)
+              createNotificationChannel()
+            }
+
+            private fun createNotificationChannel() {
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                  NOTIF_CHANNEL,
+                  "Titan Notifications",
+                  NotificationManager.IMPORTANCE_DEFAULT
+                ).apply {
+                  description = "App notifications"
+                  enableLights(true)
+                  enableVibration(true)
+                }
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.createNotificationChannel(channel)
+              }
+            }
 
             override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
               super.configureFlutterEngine(flutterEngine)
@@ -1159,6 +1278,51 @@ jobs:
                       }
                     }
 
+                    // ✅ FIX: كان مفقود — دلوقتي بيعرض إشعار native حقيقي
+                    "showNotification" -> {
+                      val title = call.argument<String>("title") ?: ""
+                      val body  = call.argument<String>("body")  ?: ""
+                      try {
+                        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                        val pi = packageManager.getLaunchIntentForPackage(packageName)
+                          ?.let { PendingIntent.getActivity(
+                            this, 0, it,
+                            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                          )}
+                        val notif = NotificationCompat.Builder(this, NOTIF_CHANNEL)
+                          .setSmallIcon(android.R.drawable.ic_dialog_info)
+                          .setContentTitle(title)
+                          .setContentText(body)
+                          .setAutoCancel(true)
+                          .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                          .apply { if (pi != null) setContentIntent(pi) }
+                          .build()
+                        nm.notify(System.currentTimeMillis().toInt(), notif)
+                        result.success("sent")
+                      } catch (e: Exception) {
+                        result.error("NOTIF_ERROR", e.message ?: "Unknown error", null)
+                      }
+                    }
+
+                    // ✅ FIX: كان مفقود — بيتحقق من إذن الـ overlay
+                    "checkOverlayPermission" -> {
+                      val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                        Settings.canDrawOverlays(this) else true
+                      result.success(granted)
+                    }
+
+                    // ✅ FIX: كان مفقود — بيفتح Settings عشان المستخدم يديه إذن الـ overlay
+                    "requestOverlayPermission" -> {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                          !Settings.canDrawOverlays(this)) {
+                        startActivity(Intent(
+                          Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                          Uri.parse("package:$packageName")
+                        ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+                      }
+                      result.success(null)
+                    }
+
                     "openDownloadsFolder" -> {
                       try {
                         val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -1196,9 +1360,6 @@ jobs:
                       }
                     }
 
-                    // FIX: return filePath (DATA column) instead of content:// URI.
-                    // content:// URIs are NOT playable by the HTML5 <video> element.
-                    // Dart wraps filePath in _TitanVideoServer.urlFor() → byte-range HTTP.
                     "getDeviceVideos" -> {
                       try {
                         val videos = mutableListOf<Map<String, Any?>>()
@@ -1245,7 +1406,7 @@ jobs:
                             } catch (_: Exception) {}
 
                             videos.add(mapOf(
-                              "filePath"  to filePath,   // ← Dart → _TitanVideoServer.urlFor()
+                              "filePath"  to filePath,
                               "title"     to name.substringBeforeLast('.'),
                               "duration"  to dur,
                               "thumbnail" to thumbB64
