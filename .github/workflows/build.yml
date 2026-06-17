@@ -383,19 +383,39 @@ jobs:
               content, count=1
           )
 
-          # ✅ FIX-KEYBOARD: adjustPan يمنع resize الـ WebView لما الكيبورد يفتح → يقضي على الـ lag
-          content = re.sub(
-              r'(<activity\b(?![^>]*windowSoftInputMode))',
-              r'\1 android:windowSoftInputMode="adjustPan"',
-              content, count=1
-          )
+          # ✅ FIX-KEYBOARD (مُصحَّح): Flutter بيحدد windowSoftInputMode="adjustResize"
+          # افتراضيًا في كل مشروع جديد. الكود القديم كان بيتحقق "لو الصفة دي مش موجودة"
+          # فيتجاهل الإضافة لأنها أصلاً موجودة بقيمة تانية → الإصلاح ميتفعّلش خالص.
+          # دلوقتي بنستبدل القيمة الموجودة فعليًا بـ adjustPan بدل ما نحاول نضيف صفة جديدة.
+          if re.search(r'android:windowSoftInputMode="[^"]*"', content):
+              content = re.sub(
+                  r'android:windowSoftInputMode="[^"]*"',
+                  'android:windowSoftInputMode="adjustPan"',
+                  content, count=1
+              )
+          else:
+              content = re.sub(
+                  r'(<activity\b(?![^>]*windowSoftInputMode))',
+                  r'\1 android:windowSoftInputMode="adjustPan"',
+                  content, count=1
+              )
 
-          # ✅ FIX-PIP: تفعيل Native Android PiP + configChanges عشان يتجنب restart
+          # ✅ FIX-PIP (مُصحَّح): كان بيضيف android:configChanges جنب supportsPictureInPicture
+          # من غير ما يتأكد إنها موجودة بالفعل. وFlutter بيحدد configChanges افتراضيًا في
+          # كل مشروع جديد، فكانت بتتكرر مرتين على نفس الـ <activity> tag — وده duplicate
+          # attribute يكسر صحة الـ XML ويوقف ManifestMerger بـ "Error parsing" بالظبط
+          # زي اللي حصل. دلوقتي بنفصل الإضافتين، وconfigChanges بس لو مش موجودة أصلاً.
           content = re.sub(
               r'(<activity\b(?![^>]*supportsPictureInPicture))',
-              r'\1 android:supportsPictureInPicture="true" android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"',
+              r'\1 android:supportsPictureInPicture="true"',
               content, count=1
           )
+          if not re.search(r'<activity\b[^>]*android:configChanges=', content):
+              content = re.sub(
+                  r'(<activity\b(?![^>]*configChanges))',
+                  r'\1 android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"',
+                  content, count=1
+              )
 
           audio_service = '''
                   <service android:name="com.ryanheise.audioservice.AudioService"
