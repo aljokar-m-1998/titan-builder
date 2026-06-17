@@ -376,10 +376,24 @@ jobs:
           app_name = os.environ.get("APP_NAME", "Flutter App")
           content = content.replace('android:label="flutter_app"', f'android:label="{app_name}"')
 
-          # ✅ FIX: نضيف showWhenLocked و turnScreenOn للـ Activity عشان يشتغل على شاشة القفل
+          # ✅ FIX: شاشة القفل
           content = re.sub(
               r'(<activity\b(?![^>]*showWhenLocked))',
               r'\1 android:showWhenLocked="true" android:turnScreenOn="true"',
+              content, count=1
+          )
+
+          # ✅ FIX-KEYBOARD: adjustPan يمنع resize الـ WebView لما الكيبورد يفتح → يقضي على الـ lag
+          content = re.sub(
+              r'(<activity\b(?![^>]*windowSoftInputMode))',
+              r'\1 android:windowSoftInputMode="adjustPan"',
+              content, count=1
+          )
+
+          # ✅ FIX-PIP: تفعيل Native Android PiP + configChanges عشان يتجنب restart
+          content = re.sub(
+              r'(<activity\b(?![^>]*supportsPictureInPicture))',
+              r'\1 android:supportsPictureInPicture="true" android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"',
               content, count=1
           )
 
@@ -756,6 +770,20 @@ jobs:
                 },
               );
 
+              // ✅ FIX-PIP: handler يستقبل طلب PiP من JS → يبعته للـ Kotlin Activity
+              ctrl.addJavaScriptHandler(
+                handlerName: 'enterPiP',
+                callback: (args) async {
+                  try {
+                    const ch = MethodChannel('titan_download');
+                    return await ch.invokeMethod<String>('enterPiP') ?? 'failed';
+                  } catch (e) {
+                    debugPrint('enterPiP: $e');
+                    return 'not_supported';
+                  }
+                },
+              );
+
               // Cinema: file paths → localhost streaming URLs
               ctrl.addJavaScriptHandler(
                 handlerName: 'getNativeVideos',
@@ -1026,6 +1054,19 @@ jobs:
               super.dispose();
             }
 
+            // ✅ FIX-AUDIO: Flutter بيعمل pauseTimers للـ WebView لما الشاشة تضلم
+            // → نعمل resumeTimers فوراً عشان الصوت يفضل شغال في الخلفية
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState state) {
+              super.didChangeAppLifecycleState(state);
+              if (state == AppLifecycleState.paused ||
+                  state == AppLifecycleState.hidden) {
+                Future.delayed(Duration.zero, () => _ctrl?.resumeTimers());
+              } else if (state == AppLifecycleState.resumed) {
+                _ctrl?.resumeTimers();
+              }
+            }
+
             @override
             Widget build(BuildContext context) {
               return PopScope(
@@ -1037,6 +1078,7 @@ jobs:
                   SystemNavigator.pop();
                 },
                 child: Scaffold(
+                  resizeToAvoidBottomInset: false, // ✅ FIX-KEYBOARD: يمنع resize عند فتح الكيبورد
                   backgroundColor: Colors.black,
                   body: SafeArea(
                     top: !_fullscreen, bottom: !_fullscreen,
@@ -1183,9 +1225,11 @@ jobs:
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.PendingIntent
+          import android.app.PictureInPictureParams
           import android.content.ContentValues
           import android.content.Context
           import android.content.Intent
+          import android.content.res.Configuration
           import android.database.Cursor
           import android.graphics.Bitmap
           import android.media.MediaScannerConnection
@@ -1197,6 +1241,7 @@ jobs:
           import android.provider.MediaStore
           import android.provider.Settings
           import android.util.Base64
+          import android.util.Rational
           import androidx.core.app.NotificationCompat
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
@@ -1419,9 +1464,38 @@ jobs:
                       }
                     }
 
+                    // ✅ FIX-PIP: Native Android Picture-in-Picture
+                    "enterPiP" -> {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        try {
+                          val params = PictureInPictureParams.Builder()
+                            .setAspectRatio(Rational(16, 9))
+                            .build()
+                          enterPictureInPictureMode(params)
+                          result.success("entered")
+                        } catch (e: Exception) {
+                          result.error("PIP_ERROR", e.message ?: "Unknown error", null)
+                        }
+                      } else {
+                        result.error("NOT_SUPPORTED", "PiP requires Android 8+", null)
+                      }
+                    }
+
                     else -> result.notImplemented()
                   }
                 }
+            }
+
+            // ✅ FIX-PIP: نبلّغ الـ WebView لما يدخل/يخرج من PiP mode
+            // عشان الموقع يقدر يكيّف الـ UI (يخفي controls مثلاً)
+            override fun onPictureInPictureModeChanged(
+              isInPiP: Boolean, newConfig: Configuration
+            ) {
+              super.onPictureInPictureModeChanged(isInPiP, newConfig)
+              flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
+                MethodChannel(messenger, "titan_download")
+                  .invokeMethod("onPiPChanged", isInPiP)
+              }
             }
           }
           KOTLIN
