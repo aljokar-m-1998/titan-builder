@@ -594,36 +594,103 @@ jobs:
           }
 
           class TitanAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
-            @override Future<void> play()  async { updatePlaybackState(true); }
-            @override Future<void> pause() async { updatePlaybackState(false); }
+            // ✅ FIX-BRIDGE: callback يتصل بالـ WebView عشان نتحكم في الميديا من الإشعار
+            // يُضبط في onWebViewCreated ويُصفَّر عند dispose
+            Function(String)? _evalJS;
+            void attachEval(Function(String) fn) => _evalJS = fn;
+            void detachEval()                    => _evalJS = null;
+
+            // ✅ FIX-BRIDGE: play/pause من الإشعار يؤثر فعلياً على الـ WebView
+            @override
+            Future<void> play() async {
+              _evalJS?.call(
+                'document.querySelectorAll("video,audio")'
+                '.forEach(function(m){m.play().catch(function(){});});'
+              );
+              updatePlaybackState(true);
+            }
+
+            @override
+            Future<void> pause() async {
+              _evalJS?.call(
+                'document.querySelectorAll("video,audio")'
+                '.forEach(function(m){m.pause();});'
+              );
+              updatePlaybackState(false);
+            }
+
             @override
             Future<void> stop() async {
+              _evalJS?.call(
+                'document.querySelectorAll("video,audio")'
+                '.forEach(function(m){m.pause();m.currentTime=0;});'
+              );
               playbackState.add(playbackState.value.copyWith(
-                playing: false, processingState: AudioProcessingState.idle, controls: []));
+                playing: false,
+                processingState: AudioProcessingState.idle,
+                controls: [],
+              ));
             }
+
+            // ✅ FIX-BRIDGE: seek من شريط الإشعار يحرك الميديا في الـ WebView
+            @override
+            Future<void> seek(Duration position) async {
+              final secs = position.inMilliseconds / 1000.0;
+              _evalJS?.call(
+                'document.querySelectorAll("video,audio")'
+                '.forEach(function(m){m.currentTime=$secs;});'
+              );
+            }
+
             @override Future<void> skipToNext()     async {}
             @override Future<void> skipToPrevious() async {}
 
-            void setNowPlaying(String title, String artUrl) {
+            void setNowPlaying(String title, String artUrl, {
+              double duration = 0, double position = 0,
+            }) {
               Uri? art;
               if (artUrl.isNotEmpty) { try { art = Uri.parse(artUrl); } catch (_) {} }
+
+              // ✅ FIX-ID: ID ثابت مبني على العنوان — بدل UUID جديد كل مرة
+              // كان UUID الجديد بيخلي audio_service يعامله كمقطع جديد ويعيد تهيئة الإشعار
+              final stableId = 'titan:${title.hashCode}';
+
               mediaItem.add(MediaItem(
-                // ✅ FIX: أزلنا \$ عشان يشتغل Dart string interpolation صح
-                id:      'webview_media_${DateTime.now().millisecondsSinceEpoch}',
-                title:   title.isNotEmpty ? title : kAppName,
-                album:   kAppName, artUri: art, playable: true));
+                id:       stableId,
+                title:    title.isNotEmpty ? title : kAppName,
+                album:    kAppName,
+                artUri:   art,
+                playable: true,
+                duration: duration > 0
+                    ? Duration(milliseconds: (duration * 1000).toInt())
+                    : null,
+              ));
+
               if (playbackState.value.processingState == AudioProcessingState.idle) {
                 updatePlaybackState(true);
               }
             }
 
-            void updatePlaybackState(bool playing) {
+            void updatePlaybackState(bool playing, {double position = 0, double duration = 0}) {
               playbackState.add(playbackState.value.copyWith(
-                playing: playing,
-                controls: [playing ? MediaControl.pause : MediaControl.play],
-                systemActions: const {MediaAction.play, MediaAction.pause, MediaAction.stop},
-                androidCompactActionIndices: const [0],
+                playing:  playing,
+                // ✅ FIX-CONTROLS: 3 أزرار في الإشعار بدل زر واحد
+                controls: [
+                  MediaControl.skipToPrevious,
+                  playing ? MediaControl.pause : MediaControl.play,
+                  MediaControl.skipToNext,
+                ],
+                systemActions: const {
+                  MediaAction.play, MediaAction.pause, MediaAction.stop,
+                  MediaAction.seek, MediaAction.seekForward, MediaAction.seekBackward,
+                },
+                // ✅ FIX-COMPACT: الأزرار الثلاثة تظهر في الإشعار المصغر
+                androidCompactActionIndices: const [0, 1, 2],
                 processingState: AudioProcessingState.ready,
+                updatePosition: Duration(milliseconds: (position * 1000).toInt()),
+                bufferedPosition: duration > 0
+                    ? Duration(milliseconds: (duration * 1000).toInt())
+                    : Duration.zero,
               ));
             }
           }
@@ -641,8 +708,11 @@ jobs:
                   androidNotificationChannelName: 'Titan Media',
                   androidNotificationIcon:        'mipmap/ic_launcher',
                   androidShowNotificationBadge:   true,
-                  androidNotificationOngoing:     false,
-                  androidStopForegroundOnPause:   true,
+                  // ✅ FIX-LOCKSCREEN: true = الإشعار لا يُمسح → يفضل على شاشة القفل
+                  androidNotificationOngoing:     true,
+                  // ✅ FIX-LOCKSCREEN: false = الفورجراوند سيرفس مش يوقف لما تعمل pause
+                  // كان true = لما تضغط pause يوقف السيرفس → يختفي من شاشة القفل
+                  androidStopForegroundOnPause:   false,
                   notificationColor:              Color(0xFF7c3aed),
                 ),
               );
@@ -709,12 +779,24 @@ jobs:
                 callback: (args) {
                   if (args.isEmpty) return;
                   try {
-                    final data     = args[0] as Map<String, dynamic>;
-                    final playing  = data['playing'] as bool?   ?? false;
-                    final rawTitle = data['title']   as String? ?? '';
-                    final artUrl   = data['artUrl']  as String? ?? '';
-                    _audioHandler?.setNowPlaying(rawTitle.isNotEmpty ? rawTitle : kAppName, artUrl);
-                    _audioHandler?.updatePlaybackState(playing);
+                    final data        = args[0] as Map<String, dynamic>;
+                    final playing     = data['playing']     as bool?   ?? false;
+                    final rawTitle    = data['title']       as String? ?? '';
+                    final artUrl      = data['artUrl']      as String? ?? '';
+                    final duration    = (data['duration']   as num?    ?? 0).toDouble();
+                    final currentTime = (data['currentTime'] as num?   ?? 0).toDouble();
+
+                    _audioHandler?.setNowPlaying(
+                      rawTitle.isNotEmpty ? rawTitle : kAppName,
+                      artUrl,
+                      duration: duration,
+                      position: currentTime,
+                    );
+                    _audioHandler?.updatePlaybackState(
+                      playing,
+                      position: currentTime,
+                      duration: duration,
+                    );
                   } catch (_) {}
                 },
               );
@@ -834,28 +916,92 @@ jobs:
                 },
               );
 
+              // ✅ FIX-BRIDGE: نربط الـ evalJS بالـ audioHandler عشان الإشعار يتحكم في الـ WebView
+              _audioHandler?.attachEval((js) => ctrl.evaluateJavascript(source: js));
+
               ctrl.evaluateJavascript(source: r"""
                 (function() {
+                  if (window._tMediaBridgeReady) return; // منع التكرار عند كل onLoadStop
+                  window._tMediaBridgeReady = true;
+
                   // ── 1. Media bridge ──────────────────────────────────────
+                  // ✅ FIX-TITLE: بيحاول مصادر متعددة بترتيب أولوية
                   function _getTitle() {
-                    var el = document.getElementById('tc-media-title');
-                    if (el && el.innerText.trim()) return el.innerText.trim();
-                    return document.title || '';
+                    // ① عنصر مخصص من TitanMediaCore
+                    var tc = document.getElementById('tc-media-title');
+                    if (tc && tc.innerText.trim()) return tc.innerText.trim();
+                    // ② og:title أو twitter:title
+                    var ogT = document.querySelector('meta[property="og:title"]') ||
+                              document.querySelector('meta[name="twitter:title"]');
+                    if (ogT && ogT.getAttribute('content')) return ogT.getAttribute('content');
+                    // ③ عنوان الصفحة
+                    return document.title || 'Titan Media';
                   }
-                  function _notify(el) {
-                    if (!el || !window.flutter_inappwebview) return;
+
+                  // ✅ FIX-ART: بيجرب 6 مصادر للصورة قبل ما يستسلم
+                  function _getArtUrl() {
+                    // ① og:image
                     var og = document.querySelector('meta[property="og:image"]');
+                    if (og && og.getAttribute('content')) return og.getAttribute('content');
+                    // ② twitter:image
+                    var tw = document.querySelector('meta[name="twitter:image"]') ||
+                             document.querySelector('meta[name="twitter:image:src"]');
+                    if (tw && tw.getAttribute('content')) return tw.getAttribute('content');
+                    // ③ apple-touch-icon (high-res)
+                    var ap = document.querySelector('link[rel="apple-touch-icon"][href]') ||
+                             document.querySelector('link[rel="apple-touch-icon-precomposed"][href]');
+                    if (ap && ap.href) return ap.href;
+                    // ④ أكبر favicon
+                    var fav = document.querySelector('link[rel="icon"][sizes="192x192"]') ||
+                              document.querySelector('link[rel="icon"][sizes="128x128"]') ||
+                              document.querySelector('link[rel~="icon"]');
+                    if (fav && fav.href) return fav.href;
+                    // ⑤ لو في فيديو، جرب poster
+                    var vid = document.querySelector('video[poster]');
+                    if (vid && vid.poster) return vid.poster;
+                    // ⑥ أقرب صورة لعنصر audio
+                    var aud = document.querySelector('audio');
+                    if (aud) {
+                      var img = aud.closest('[class*="player"],[class*="Player"],'
+                        + '[id*="player"],[id*="Player"]')
+                        || aud.parentElement || aud.parentElement;
+                      if (img) {
+                        var i = img.querySelector('img[src]');
+                        if (i && i.src) return i.src;
+                      }
+                    }
+                    return '';
+                  }
+
+                  // ✅ FIX-THROTTLE: timeupdate بيتنشر كتير جداً — نخفف لمرة كل ثانية
+                  var _lastNotify = 0;
+                  function _notify(el, force) {
+                    if (!el || !window.flutter_inappwebview) return;
+                    var now = Date.now();
+                    if (!force && now - _lastNotify < 1000) return; // throttle 1s
+                    _lastNotify = now;
                     window.flutter_inappwebview.callHandler('titanMediaUpdate', {
-                      playing: !el.paused, title: _getTitle(),
-                      artUrl: og ? og.getAttribute('content') : ''
+                      playing:     !el.paused,
+                      title:       _getTitle(),
+                      artUrl:      _getArtUrl(),
+                      // ✅ FIX-SCRUBBER: نبعت position و duration عشان شريط التقديم يشتغل
+                      duration:    isFinite(el.duration) ? el.duration : 0,
+                      currentTime: el.currentTime || 0,
                     });
                   }
+
                   function _attach(el) {
                     if (el._tBridged) return; el._tBridged = true;
+                    // play/pause/ended — force notify فوراً
                     ['play','pause','ended'].forEach(function(ev) {
-                      el.addEventListener(ev, function() { _notify(el); });
+                      el.addEventListener(ev, function() { _notify(el, true); });
                     });
+                    // ✅ FIX-POSITION: timeupdate بيحدّث الـ scrubber في الإشعار كل ثانية
+                    el.addEventListener('timeupdate', function() { _notify(el, false); });
+                    // ✅ FIX-ART: لو الـ metadata وصلت بعدين (كتير بيحصل في audio streams)
+                    el.addEventListener('loadedmetadata', function() { _notify(el, true); });
                   }
+
                   document.querySelectorAll('video,audio').forEach(_attach);
                   if (!window._tMO) {
                     window._tMO = new MutationObserver(function(ms) {
@@ -868,10 +1014,11 @@ jobs:
                     });
                     window._tMO.observe(document.documentElement, {childList:true,subtree:true});
                   }
+                  // ✅ FIX-SPA: polling أسرع عشان المواقع الـ SPA اللي تضيف الميديا بعدين
                   if (!window._tPoll) {
                     window._tPoll = setInterval(function() {
                       document.querySelectorAll('video,audio').forEach(_attach);
-                    }, 3000);
+                    }, 1500);
                   }
                   // ── 2. Blob download interceptor ─────────────────────────
                   if (!window._tBlobDl && window.flutter_inappwebview) {
@@ -1070,6 +1217,8 @@ jobs:
 
             @override
             void dispose() {
+              // ✅ FIX-BRIDGE: فك الربط بين الـ WebView والـ audioHandler عند التخلص
+              _audioHandler?.detachEval();
               WidgetsBinding.instance.removeObserver(this);
               super.dispose();
             }
