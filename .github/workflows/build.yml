@@ -435,6 +435,19 @@ jobs:
           if 'com.ryanheise.audioservice.AudioService' not in content:
               content = content.replace('</application>', audio_service + '    </application>')
 
+          # ✅ FIX-SHARE: نضيف intent-filter يخلي التطبيق يظهر في قائمة "مشاركة" بتاعة
+          # تطبيقات تانية — مطابق لـ share_target.params في manifest.json بتاع الموقع
+          # (title/text/url) — استقباله في Kotlin/Dart عبر MethodChannel.
+          share_intent_filter = '''
+                  <intent-filter>
+                      <action android:name="android.intent.action.SEND"/>
+                      <category android:name="android.intent.category.DEFAULT"/>
+                      <data android:mimeType="text/plain"/>
+                  </intent-filter>
+          '''
+          if 'android.intent.action.SEND' not in content:
+              content = content.replace('</activity>', share_intent_filter + '        </activity>', 1)
+
           provider = '''    <provider
                       android:name="androidx.core.content.FileProvider"
                       android:authorities="${applicationId}.fileprovider"
@@ -757,11 +770,46 @@ jobs:
               WidgetsBinding.instance.addObserver(this);
               _requestPermissions();
               _checkConnectivity();
+              _setupShareHandling(); // ✅ FIX-SHARE: استقبال مشاركات من تطبيقات تانية
               Connectivity().onConnectivityChanged.listen((r) {
                 if (!mounted) return;
                 final wasOffline = _offline;
                 setState(() => _offline = r.contains(ConnectivityResult.none));
                 if (wasOffline && !_offline && _error) _ctrl?.reload();
+              });
+            }
+
+            // ✅ FIX-SHARE: حالتين — (تشغيل دافئ) Kotlin يبعت مباشرة عبر setMethodCallHandler
+            // و(تشغيل بارد) بنسحب البيانات يدوياً مرة واحدة بعد فتح التطبيق
+            void _setupShareHandling() {
+              const ch = MethodChannel('titan_download');
+              ch.setMethodCallHandler((call) async {
+                if (call.method == 'onSharedContent' && call.arguments is Map) {
+                  _navigateWithShareData(Map<String, dynamic>.from(call.arguments as Map));
+                }
+                return null;
+              });
+              Future.delayed(const Duration(milliseconds: 100), () async {
+                try {
+                  final data = await ch.invokeMethod<Map>('getPendingShare');
+                  if (data != null) {
+                    _navigateWithShareData(Map<String, dynamic>.from(data));
+                  }
+                } catch (_) {}
+              });
+            }
+
+            // ✅ FIX-SHARE: نبني رابط بنفس معايير share_target.params اللي معلنها الموقع
+            // (title/text/url) وننقل الـ WebView له بعد أول تحميل
+            void _navigateWithShareData(Map<String, dynamic> data) {
+              final title = Uri.encodeQueryComponent((data['title'] ?? '').toString());
+              final text  = Uri.encodeQueryComponent((data['text']  ?? '').toString());
+              final url   = Uri.encodeQueryComponent((data['url']   ?? '').toString());
+              if (title.isEmpty && text.isEmpty && url.isEmpty) return;
+              final sep    = kAppUrl.contains('?') ? '&' : '?';
+              final target = '$kAppUrl$sep' 'title=$title&text=$text&url=$url';
+              Future.delayed(const Duration(milliseconds: 300), () {
+                _ctrl?.loadUrl(urlRequest: URLRequest(url: WebUri(target)));
               });
             }
 
@@ -921,6 +969,34 @@ jobs:
 
               ctrl.evaluateJavascript(source: r"""
                 (function() {
+                  // ✅ FIX-CAPACITOR: الموقع بيفحص window.Capacitor.isNative عشان يقرر
+                  // يحفظ الملف عن طريق Capacitor.Plugins.Filesystem ولا fallback عادي.
+                  // إحنا مش تطبيق Capacitor، فـ window.Capacitor كانت undefined →
+                  // الموقع يدخل في الـ fallback (anchor.click() على عنصر منفصل عن الصفحة)
+                  // وده مش بيوصل لحدث click على document فعملنا polyfill بسيط يوصّل
+                  // مباشرة لقناة الحفظ الأصلية بتاعتنا (نفس اللي اتأكد إنها شغالة).
+                  window.Capacitor = window.Capacitor || {
+                    isNative: true,
+                    getPlatform: function() { return 'android'; },
+                    Plugins: {
+                      Filesystem: {
+                        writeFile: function(opts) {
+                          return new Promise(function(resolve, reject) {
+                            if (!window.flutter_inappwebview) { reject('no_bridge'); return; }
+                            var path = (opts && opts.path) || 'file';
+                            var name = path.split('/').pop();
+                            window.flutter_inappwebview.callHandler('saveFileBytes', {
+                              data: opts.data, fileName: name, mimeType: ''
+                            }).then(function(res) {
+                              if (res === 'saved') resolve({ uri: 'file://' + name });
+                              else reject(res || 'save_failed');
+                            }).catch(reject);
+                          });
+                        }
+                      }
+                    }
+                  };
+
                   if (window._tMediaBridgeReady) return; // منع التكرار عند كل onLoadStop
                   window._tMediaBridgeReady = true;
 
@@ -1422,10 +1498,39 @@ jobs:
             private val CHANNEL        = "titan_download"
             private val NOTIF_CHANNEL  = "titan_channel"
 
+            // ✅ FIX-SHARE: نخزن بيانات المشاركة الواردة لحد ما الـ WebView يبقى جاهز يسحبها
+            private var pendingShare: Map<String, String>? = null
+
             // ✅ FIX: نسجل الـ notification channel لما التطبيق يفتح (لازم قبل أي إشعار)
             override fun onCreate(savedInstanceState: Bundle?) {
               super.onCreate(savedInstanceState)
               createNotificationChannel()
+              // ✅ FIX-SHARE: تشغيل بارد — التطبيق اتفتح مباشرة من المشاركة
+              pendingShare = extractShareIntent(intent)
+            }
+
+            // ✅ FIX-SHARE: تشغيل دافئ — التطبيق شغال بالفعل والمستخدم بعت مشاركة جديدة
+            override fun onNewIntent(intent: Intent) {
+              super.onNewIntent(intent)
+              val data = extractShareIntent(intent) ?: return
+              flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
+                MethodChannel(messenger, CHANNEL).invokeMethod("onSharedContent", data)
+              }
+            }
+
+            // ✅ FIX-SHARE: يستخرج title/text/url من intent المشاركة — نفس مفاتيح
+            // share_target.params في manifest.json بتاع الموقع (معيار PWA قياسي)
+            private fun extractShareIntent(intent: Intent?): Map<String, String>? {
+              if (intent?.action != Intent.ACTION_SEND) return null
+              val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: ""
+              val subj = intent.getStringExtra(Intent.EXTRA_SUBJECT) ?: ""
+              if (text.isEmpty() && subj.isEmpty()) return null
+              val looksLikeUrl = text.startsWith("http://") || text.startsWith("https://")
+              return mapOf(
+                "title" to subj,
+                "text"  to text,
+                "url"   to (if (looksLikeUrl) text else "")
+              )
             }
 
             private fun createNotificationChannel() {
@@ -1648,6 +1753,12 @@ jobs:
                       } else {
                         result.error("NOT_SUPPORTED", "PiP requires Android 8+", null)
                       }
+                    }
+
+                    // ✅ FIX-SHARE: الـ Dart بيسحب بيانات المشاركة دي مرة واحدة بعد ما يفتح
+                    "getPendingShare" -> {
+                      result.success(pendingShare)
+                      pendingShare = null
                     }
 
                     else -> result.notImplemented()
