@@ -721,10 +721,16 @@ jobs:
                   androidNotificationChannelName: 'Titan Media',
                   androidNotificationIcon:        'mipmap/ic_launcher',
                   androidShowNotificationBadge:   true,
-                  // ✅ FIX-LOCKSCREEN: true = الإشعار لا يُمسح → يفضل على شاشة القفل
-                  androidNotificationOngoing:     true,
+                  // ✅ FIX-COMPILE: الباكدج نفسها فيها assert وقت الكومبايل بيرفض
+                  // ongoing=true مع stopForegroundOnPause=false معًا (سطر تحته).
+                  // لكن مفيش داعي لـ "ongoing" أصلاً هنا — لما السيرفس فاضل Foreground
+                  // باستمرار (الفلاج اللي تحت) أندرويد نفسه بيمنع مسح الإشعار تلقائيًا،
+                  // فـ "ongoing" بقى زيادة بلا فايدة (ده حرفيًا نص رسالة الخطأ).
+                  androidNotificationOngoing:     false,
                   // ✅ FIX-LOCKSCREEN: false = الفورجراوند سيرفس مش يوقف لما تعمل pause
                   // كان true = لما تضغط pause يوقف السيرفس → يختفي من شاشة القفل
+                  // (وده برضو الطريقة الموصى بها رسميًا من الباكدج لتجنب كرّاش
+                  // ForegroundServiceStartNotAllowedException على أندرويد 12+)
                   androidStopForegroundOnPause:   false,
                   notificationColor:              Color(0xFF7c3aed),
                 ),
