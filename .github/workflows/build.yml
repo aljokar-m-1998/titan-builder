@@ -49,6 +49,14 @@ on:
         description: 'PWA manifest.json URL (for pwa_twa mode)'
         required: false
         default: ''
+      version_name:
+        description: 'Version name shown to users (e.g. 1.2.0) — leave empty to keep previous'
+        required: false
+        default: ''
+      version_code:
+        description: 'Version code, must increase each update — leave empty to auto-increment'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -72,6 +80,62 @@ jobs:
           BUILD_TYPE="${BUILD_TYPE:-webview}"
           echo "BUILD_TYPE=$BUILD_TYPE" >> $GITHUB_ENV
           echo "🔍 Build type: $BUILD_TYPE"
+
+      # ✅ FIX-UPDATE: نحلّ مشكلتين سببهما واحد — كل بناء كان بيولّد keystore
+      # عشوائي جديد (توقيع مختلف كل مرة) ونسخة (versionCode) ثابتة دايمًا.
+      # أندرويد بيرفض اعتبار أي تثبيت "تحديث" إلا لو: نفس التوقيع + رقم نسخة
+      # أعلى من المثبّت حاليًا. الحل: نخزّن الـ keystore ونرقم آخر نسخة في
+      # نفس HF Dataset المستخدم أصلاً، ونعيد استخدامهم في كل بناء تالي لنفس
+      # التطبيق (بنفس الاسم → نفس APP_SLUG).
+      - name: Resolve Persistent Keystore & Version
+        run: |
+          APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          echo "APP_SLUG=$APP_SLUG" >> $GITHUB_ENV
+
+          pip install huggingface_hub -q
+
+          mkdir -p /tmp/keystore_cache
+          python3 - << 'PYEOF'
+          import json, os, sys
+          from huggingface_hub import hf_hub_download
+
+          app_slug    = os.environ["APP_SLUG"]
+          hf_dataset  = "${{ github.event.inputs.hf_dataset }}"
+          hf_token    = "${{ github.event.inputs.hf_token }}"
+          in_version_name = "${{ github.event.inputs.version_name }}".strip()
+          in_version_code = "${{ github.event.inputs.version_code }}".strip()
+
+          meta = {}
+          jks_path = f"keystores/{app_slug}.jks"
+          meta_path = f"keystores/{app_slug}.json"
+
+          try:
+              local_jks = hf_hub_download(repo_id=hf_dataset, repo_type="dataset",
+                                           filename=jks_path, token=hf_token)
+              local_meta = hf_hub_download(repo_id=hf_dataset, repo_type="dataset",
+                                            filename=meta_path, token=hf_token)
+              with open(local_meta) as f:
+                  meta = json.load(f)
+              import shutil
+              shutil.copy(local_jks, "/tmp/keystore_cache/release.jks")
+              print(f"✅ Found previous keystore for '{app_slug}' — reusing (update-compatible)")
+          except Exception as e:
+              print(f"ℹ️ No previous keystore found for '{app_slug}' — will generate a new one ({e})")
+
+          last_code = int(meta.get("version_code", 0))
+          resolved_code = int(in_version_code) if in_version_code else (last_code + 1)
+          resolved_name = in_version_name if in_version_name else meta.get("version_name", "1.0.0")
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"KEYSTORE_REUSED={'true' if meta else 'false'}\n")
+              f.write(f"KEY_ALIAS={meta.get('key_alias','')}\n")
+              f.write(f"KS_PASS={meta.get('ks_pass','')}\n")
+              f.write(f"KEY_PASS={meta.get('key_pass','')}\n")
+              f.write(f"RESOLVED_VERSION_NAME={resolved_name}\n")
+              f.write(f"RESOLVED_VERSION_CODE={resolved_code}\n")
+
+          print(f"📦 version: {resolved_name} (code {resolved_code})")
+          PYEOF
 
       # ── Step 1 (TWA/PWA): Bubblewrap Build ─────────────────────────────────
       - name: Build TWA App with Bubblewrap
@@ -592,12 +656,27 @@ jobs:
             }
 
             static String _mime(String p) {
-              if (p.endsWith('.mp4') || p.endsWith('.m4v')) return 'video/mp4';
-              if (p.endsWith('.mkv'))  return 'video/x-matroska';
-              if (p.endsWith('.avi'))  return 'video/x-msvideo';
-              if (p.endsWith('.mov'))  return 'video/quicktime';
-              if (p.endsWith('.webm')) return 'video/webm';
-              if (p.endsWith('.3gp'))  return 'video/3gpp';
+              final lp = p.toLowerCase();
+              if (lp.endsWith('.mp4') || lp.endsWith('.m4v')) return 'video/mp4';
+              if (lp.endsWith('.mkv'))  return 'video/x-matroska';
+              if (lp.endsWith('.avi'))  return 'video/x-msvideo';
+              if (lp.endsWith('.mov'))  return 'video/quicktime';
+              if (lp.endsWith('.webm')) return 'video/webm';
+              if (lp.endsWith('.3gp'))  return 'video/3gpp';
+              // ✅ FIX-PHOTOS/MUSIC: السيرفر المحلي بقى بيخدم الصور والصوتيات
+              // كمان (نفس آلية بث الفيديو بالـ byte-range)، مش الفيديو بس
+              if (lp.endsWith('.jpg') || lp.endsWith('.jpeg')) return 'image/jpeg';
+              if (lp.endsWith('.png'))  return 'image/png';
+              if (lp.endsWith('.webp')) return 'image/webp';
+              if (lp.endsWith('.gif'))  return 'image/gif';
+              if (lp.endsWith('.heic')) return 'image/heic';
+              if (lp.endsWith('.bmp'))  return 'image/bmp';
+              if (lp.endsWith('.mp3'))  return 'audio/mpeg';
+              if (lp.endsWith('.m4a'))  return 'audio/mp4';
+              if (lp.endsWith('.aac'))  return 'audio/aac';
+              if (lp.endsWith('.wav'))  return 'audio/wav';
+              if (lp.endsWith('.ogg'))  return 'audio/ogg';
+              if (lp.endsWith('.flac')) return 'audio/flac';
               return 'video/mp4';
             }
 
@@ -770,19 +849,69 @@ jobs:
             bool _fullscreen    = false;
             bool _hasLoadedOnce = false;
 
+            // ✅ FIX-OFFLINE: نحسم مصدر التحميل الأول (نت أو نسخة محفوظة) قبل
+            // ما الـ WebView يُبنى، عشان الموقع يفتح فورًا من غير ما يحاول
+            // النت ويفشل — وبعد كذا الموقع نفسه (Firestore offline) بيكمل
+            // العرض من بياناته المحلية المخزّنة فعليًا من قبل.
+            bool   _initDecisionMade = false;
+            bool   _useOfflineShell  = false;
+            String _cachedShellHtml  = '';
+
             @override
             void initState() {
               super.initState();
               WidgetsBinding.instance.addObserver(this);
               _requestPermissions();
               _checkConnectivity();
+              _resolveInitialSource(); // ✅ FIX-OFFLINE
               _setupShareHandling(); // ✅ FIX-SHARE: استقبال مشاركات من تطبيقات تانية
               Connectivity().onConnectivityChanged.listen((r) {
                 if (!mounted) return;
                 final wasOffline = _offline;
-                setState(() => _offline = r.contains(ConnectivityResult.none));
+                final nowOffline = r.contains(ConnectivityResult.none);
+                setState(() => _offline = nowOffline);
+                // ✅ FIX-OFFLINE: نخلي الـ WebView يفضّل الكاش وقت انعدام النت،
+                // ويرجع للسلوك الطبيعي (محتوى محدّث) لما النت يرجع
+                _ctrl?.setSettings(settings: InAppWebViewSettings(
+                  cacheMode: nowOffline ? CacheMode.LOAD_CACHE_ELSE_NETWORK : CacheMode.LOAD_DEFAULT,
+                  networkAvailable: !nowOffline,
+                ));
                 if (wasOffline && !_offline && _error) _ctrl?.reload();
               });
+            }
+
+            // ✅ FIX-OFFLINE: لو مفيش نت وقت الفتح، نجرّب نلاقي نسخة محفوظة
+            // من آخر تحميل ناجح، ونفتحها بدل ما نحاول النت ونفشل بلا فايدة
+            Future<void> _resolveInitialSource() async {
+              try {
+                final r = await Connectivity().checkConnectivity();
+                if (r.contains(ConnectivityResult.none)) {
+                  final dir  = await getApplicationDocumentsDirectory();
+                  final file = File('${dir.path}/titan_offline_shell.html');
+                  if (await file.exists()) {
+                    _cachedShellHtml = await file.readAsString();
+                    _useOfflineShell = _cachedShellHtml.trim().isNotEmpty;
+                  }
+                }
+              } catch (e) { debugPrint('_resolveInitialSource: $e'); }
+              if (mounted) setState(() => _initDecisionMade = true);
+            }
+
+            // ✅ FIX-OFFLINE: نخزّن نسخة من الصفحة بعد كل تحميل ناجح عن طريق
+            // النت — مش نسخة الـ DOM بعد تعديلات الجافاسكريبت، إنما الاستجابة
+            // الأصلية من السيرفر، عشان لما تُعاد فتحها تشتغل بشكل سليم وتقدر
+            // تبدأ سكريبتات الموقع تاني من الصفر (Firestore وغيرها)
+            Future<void> _cacheShellForOffline() async {
+              if (_offline) return;
+              try {
+                final res  = await Dio().get<String>(kAppUrl,
+                    options: Options(responseType: ResponseType.plain));
+                final body = res.data ?? '';
+                if (body.trim().isEmpty) return;
+                final dir  = await getApplicationDocumentsDirectory();
+                final file = File('${dir.path}/titan_offline_shell.html');
+                await file.writeAsString(body, flush: true);
+              } catch (e) { debugPrint('_cacheShellForOffline: $e'); }
             }
 
             // ✅ FIX-SHARE: حالتين — (تشغيل دافئ) Kotlin يبعت مباشرة عبر setMethodCallHandler
@@ -959,14 +1088,116 @@ jobs:
                       final filePath = v['filePath'] as String? ?? '';
                       if (filePath.isEmpty) continue;
                       videos.add({
-                        'url':       _TitanVideoServer.urlFor(filePath),
-                        'title':     v['title']     ?? '',
-                        'duration':  v['duration']  ?? 0,
-                        'thumbnail': v['thumbnail'] ?? '',
+                        'url':         _TitanVideoServer.urlFor(filePath),
+                        'filePath':    filePath,
+                        'title':       v['title']       ?? '',
+                        'duration':    v['duration']     ?? 0,
+                        'thumbnail':   v['thumbnail']    ?? '',
+                        // ✅ FIX-VTT: ترجمة مجاورة (لو موجودة) تتحمّل تلقائيًا
+                        'subtitleVtt': v['subtitleVtt'],
                       });
                     }
                     return videos;
                   } catch (e) { debugPrint('getNativeVideos: $e'); return <Map>[]; }
+                },
+              );
+
+              // ✅ FIX-MUSIC: نفس فكرة getNativeVideos بس لمكتبة الموسيقى
+              ctrl.addJavaScriptHandler(
+                handlerName: 'getNativeAudios',
+                callback: (args) async {
+                  try {
+                    final sdkInt = await _getSdkInt();
+                    bool granted = sdkInt >= 33
+                        ? (await Permission.audio.request()).isGranted
+                        : (await Permission.storage.request()).isGranted;
+                    if (!granted) return <Map>[];
+                    const ch  = MethodChannel('titan_download');
+                    final raw = await ch.invokeMethod<List>('getDeviceAudios');
+                    if (raw == null || raw.isEmpty) return <Map>[];
+                    final audios = <Map<String, dynamic>>[];
+                    for (final item in raw) {
+                      final v        = Map<String, dynamic>.from(item as Map);
+                      final filePath = v['filePath'] as String? ?? '';
+                      if (filePath.isEmpty) continue;
+                      audios.add({
+                        'url':       _TitanVideoServer.urlFor(filePath),
+                        'filePath':  filePath,
+                        'title':     v['title']     ?? '',
+                        'artist':    v['artist']    ?? '',
+                        'duration':  v['duration']  ?? 0,
+                        'thumbnail': v['thumbnail'] ?? '',
+                      });
+                    }
+                    return audios;
+                  } catch (e) { debugPrint('getNativeAudios: $e'); return <Map>[]; }
+                },
+              );
+
+              // ✅ FIX-PHOTOS: نفس الفكرة لمكتبة الصور
+              ctrl.addJavaScriptHandler(
+                handlerName: 'getNativeImages',
+                callback: (args) async {
+                  try {
+                    final sdkInt = await _getSdkInt();
+                    bool granted = sdkInt >= 33
+                        ? (await Permission.photos.request()).isGranted
+                        : (await Permission.storage.request()).isGranted;
+                    if (!granted) return <Map>[];
+                    const ch  = MethodChannel('titan_download');
+                    final raw = await ch.invokeMethod<List>('getDeviceImages');
+                    if (raw == null || raw.isEmpty) return <Map>[];
+                    final images = <Map<String, dynamic>>[];
+                    for (final item in raw) {
+                      final v        = Map<String, dynamic>.from(item as Map);
+                      final filePath = v['filePath'] as String? ?? '';
+                      if (filePath.isEmpty) continue;
+                      images.add({
+                        'url':       _TitanVideoServer.urlFor(filePath),
+                        'filePath':  filePath,
+                        'title':     v['title']     ?? '',
+                        'dateAdded': v['dateAdded'] ?? 0,
+                        'thumbnail': v['thumbnail'] ?? '',
+                      });
+                    }
+                    return images;
+                  } catch (e) { debugPrint('getNativeImages: $e'); return <Map>[]; }
+                },
+              );
+
+              // ✅ FIX-DELETE: حذف ملف من الجهاز (فيديو/صوت/صورة) — يطلب موافقة
+              // المستخدم من نافذة النظام نفسها على أندرويد 10/11+
+              ctrl.addJavaScriptHandler(
+                handlerName: 'deleteDeviceFile',
+                callback: (args) async {
+                  if (args.isEmpty) return 'error';
+                  try {
+                    final data     = args[0] as Map<String, dynamic>;
+                    final filePath = data['filePath'] as String? ?? '';
+                    if (filePath.isEmpty) return 'error';
+                    const ch = MethodChannel('titan_download');
+                    return await ch.invokeMethod<String>('deleteDeviceFile', {
+                      'filePath': filePath,
+                    }) ?? 'error';
+                  } catch (e) { debugPrint('deleteDeviceFile: $e'); return 'error'; }
+                },
+              );
+
+              // ✅ FIX-SHARE: مشاركة ملف من الجهاز لتطبيقات أخرى
+              ctrl.addJavaScriptHandler(
+                handlerName: 'shareDeviceFile',
+                callback: (args) async {
+                  if (args.isEmpty) return 'error';
+                  try {
+                    final data     = args[0] as Map<String, dynamic>;
+                    final filePath = data['filePath'] as String? ?? '';
+                    final mimeType = data['mimeType'] as String? ?? '*/*';
+                    if (filePath.isEmpty) return 'error';
+                    const ch = MethodChannel('titan_download');
+                    return await ch.invokeMethod<String>('shareDeviceFile', {
+                      'filePath': filePath, 'mimeType': mimeType,
+                    }) ?? 'error';
+                  } catch (e) { debugPrint('shareDeviceFile: $e'); return 'error'; }
                 },
               );
 
@@ -1082,6 +1313,23 @@ jobs:
                     el.addEventListener('timeupdate', function() { _notify(el, false); });
                     // ✅ FIX-ART: لو الـ metadata وصلت بعدين (كتير بيحصل في audio streams)
                     el.addEventListener('loadedmetadata', function() { _notify(el, true); });
+                  }
+
+                  // ✅ FIX-DETACHED-AUDIO: مواقع كتير بتعمل مشغّل صوت مخصص بالكود
+                  // new Audio(blobUrl) — وده عنصر في الذاكرة بس، مش متصل بالصفحة
+                  // خالص، فـ querySelectorAll وMutationObserver مايلاقوهوش أبداً.
+                  // الحل: نعترض الـ constructor العالمي بتاع Audio نفسه، فأي new Audio()
+                  // في أي موقع يتلقط لحظة إنشائه — قبل ما نعرف هيتحط في الصفحة ولا مش هيتحط.
+                  if (!window._tAudioCtorPatched && typeof window.Audio === 'function') {
+                    window._tAudioCtorPatched = true;
+                    var _NativeAudio = window.Audio;
+                    var _TitanAudio = function(src) {
+                      var el = (src !== undefined) ? new _NativeAudio(src) : new _NativeAudio();
+                      _attach(el);
+                      return el;
+                    };
+                    _TitanAudio.prototype = _NativeAudio.prototype;
+                    window.Audio = _TitanAudio;
                   }
 
                   document.querySelectorAll('video,audio').forEach(_attach);
@@ -1331,17 +1579,38 @@ jobs:
                 child: Scaffold(
                   resizeToAvoidBottomInset: false, // ✅ FIX-KEYBOARD: يمنع resize عند فتح الكيبورد
                   backgroundColor: Colors.black,
-                  body: SafeArea(
+                  // ✅ FIX-OFFLINE: لحظات بسيطة لحسم مصدر التحميل (نت/كاش) قبل
+                  // ما الـ WebView يُبنى أصلاً — يمنع وميض شاشة خطأ لا داعي له
+                  body: !_initDecisionMade
+                    ? const Center(child: CircularProgressIndicator(color: Colors.white24))
+                    : SafeArea(
                     top: !_fullscreen, bottom: !_fullscreen,
                     child: Stack(children: [
 
                       InAppWebView(
-                        initialUrlRequest: URLRequest(url: WebUri(kAppUrl)),
+                        initialUrlRequest: _useOfflineShell
+                            ? null : URLRequest(url: WebUri(kAppUrl)),
+                        // ✅ FIX-OFFLINE: نفتح من النسخة المحفوظة محليًا لو معندناش نت
+                        // — baseUrl يفضل يشاور على الدومين الحقيقي عشان أي مسارات
+                        // نسبية (JS/CSS) تحاول تتحمّل من نفس الكاش الطبيعي للمتصفح
+                        initialData: _useOfflineShell
+                            ? InAppWebViewInitialData(
+                                data: _cachedShellHtml,
+                                mimeType: 'text/html',
+                                encoding: 'utf-8',
+                                baseUrl: WebUri(kAppUrl),
+                              )
+                            : null,
                         initialSettings: InAppWebViewSettings(
                           javaScriptEnabled: true,
                           javaScriptCanOpenWindowsAutomatically: true,
                           domStorageEnabled: true, databaseEnabled: true,
                           cacheEnabled: true, clearCache: false,
+                          // ✅ FIX-OFFLINE: لو فاتح من الكاش، نفضّل أي نسخة محفوظة
+                          // من باقي الموارد (JS/CSS) بدل ما نحاول الشبكة ونفشل
+                          cacheMode: _useOfflineShell
+                              ? CacheMode.LOAD_CACHE_ELSE_NETWORK : CacheMode.LOAD_DEFAULT,
+                          networkAvailable: !_offline,
                           allowFileAccessFromFileURLs: true,
                           allowUniversalAccessFromFileURLs: true,
                           thirdPartyCookiesEnabled: true,
@@ -1367,6 +1636,7 @@ jobs:
                           final p = await SharedPreferences.getInstance();
                           await p.setString('lastUrl', url?.toString() ?? kAppUrl);
                           _setupMediaBridge(c);
+                          _cacheShellForOffline(); // ✅ FIX-OFFLINE: تحديث النسخة المحفوظة
                         },
                         onReceivedError: (c, req, err) {
                           if (req.isForMainFrame == true && mounted)
@@ -1421,13 +1691,26 @@ jobs:
                           child: LinearProgressIndicator(
                             backgroundColor: Colors.transparent, color: Colors.blue, minHeight: 3)),
 
-                      if (_offline && !_hasLoadedOnce)
+                      // ✅ FIX-OFFLINE: شريط بسيط يوضّح إنك شغال على نسخة محفوظة
+                      if (_offline && _useOfflineShell)
+                        Positioned(top: 0, left: 0, right: 0,
+                          child: Container(
+                            color: const Color(0xFF424242),
+                            padding: const EdgeInsets.symmetric(vertical: 6),
+                            child: const Text('وضع عدم الاتصال — تعرض بيانات محفوظة',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: Colors.white, fontSize: 12)),
+                          )),
+
+                      // ✅ FIX-OFFLINE: نخفي شاشة "مفيش نت" دي لو فاتحين أصلاً من
+                      // نسخة محفوظة (الموقع شغال ومحتواه ظاهر تحتها فعليًا)
+                      if (_offline && !_hasLoadedOnce && !_useOfflineShell)
                         Container(color: Colors.white, child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
                           const Icon(Icons.wifi_off_rounded, size: 72, color: Color(0xFFE53935)),
                           const SizedBox(height: 16),
                           const Text('لا يوجد اتصال بالإنترنت', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                           const SizedBox(height: 8),
-                          const Text('تحقق من الاتصال وحاول مجدداً', style: TextStyle(color: Color(0xFF757575))),
+                          const Text('افتح التطبيق مرة على الإنترنت أولاً لتفعيل العمل دون اتصال', style: TextStyle(color: Color(0xFF757575)), textAlign: TextAlign.center),
                           const SizedBox(height: 24),
                           ElevatedButton.icon(
                             onPressed: () { _checkConnectivity(); _ctrl?.reload(); },
@@ -1473,16 +1756,19 @@ jobs:
           cat > "$PKG_PATH/MainActivity.kt" << 'KOTLIN'
           package com.titan.APP_SLUG_PLACEHOLDER
 
+          import android.app.Activity
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.PendingIntent
           import android.app.PictureInPictureParams
+          import android.app.RecoverableSecurityException
           import android.content.ContentValues
           import android.content.Context
           import android.content.Intent
           import android.content.res.Configuration
           import android.database.Cursor
           import android.graphics.Bitmap
+          import android.media.MediaMetadataRetriever
           import android.media.MediaScannerConnection
           import android.media.ThumbnailUtils
           import android.net.Uri
@@ -1503,6 +1789,11 @@ jobs:
           class MainActivity : FlutterActivity() {
             private val CHANNEL        = "titan_download"
             private val NOTIF_CHANNEL  = "titan_channel"
+            private val DELETE_REQUEST_CODE = 7321
+
+            // ✅ FIX-DELETE: نخزن نتيجة طلب الحذف لحد ما المستخدم يوافق/يرفض
+            // من نافذة النظام (مطلوب من أندرويد 10+ للملفات اللي التطبيق مش مالكها)
+            private var pendingDeleteResult: MethodChannel.Result? = null
 
             // ✅ FIX-SHARE: نخزن بيانات المشاركة الواردة لحد ما الـ WebView يبقى جاهز يسحبها
             private var pendingShare: Map<String, String>? = null
@@ -1522,6 +1813,44 @@ jobs:
               flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
                 MethodChannel(messenger, CHANNEL).invokeMethod("onSharedContent", data)
               }
+            }
+
+            // ✅ FIX-DELETE: أندرويد 10/11+ بيرجع نتيجة موافقة المستخدم هنا —
+            // لازم نكمل الـ Future بتاع Dart بالنتيجة الصحيحة (نجح/رفض المستخدم)
+            @Deprecated("Deprecated in Java")
+            override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+              super.onActivityResult(requestCode, resultCode, data)
+              if (requestCode == DELETE_REQUEST_CODE) {
+                if (resultCode == Activity.RESULT_OK) {
+                  pendingDeleteResult?.success("deleted")
+                } else {
+                  pendingDeleteResult?.success("cancelled")
+                }
+                pendingDeleteResult = null
+              }
+            }
+
+            // ✅ FIX-DELETE/SHARE: يحوّل مسار ملف فعلي لـ content:// URI من MediaStore
+            // (مطلوب للحذف والمشاركة الآمنين بدل التعامل المباشر مع المسار)
+            private fun getMediaStoreUri(filePath: String): Uri? {
+              val collections = listOf(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+              )
+              for (collection in collections) {
+                val cursor = contentResolver.query(
+                  collection, arrayOf(MediaStore.MediaColumns._ID),
+                  "${MediaStore.MediaColumns.DATA} = ?", arrayOf(filePath), null
+                )
+                cursor?.use {
+                  if (it.moveToFirst()) {
+                    val id = it.getLong(0)
+                    return Uri.withAppendedPath(collection, id.toString())
+                  }
+                }
+              }
+              return null
             }
 
             // ✅ FIX-SHARE: يستخرج title/text/url من intent المشاركة — نفس مفاتيح
@@ -1730,17 +2059,205 @@ jobs:
                               }
                             } catch (_: Exception) {}
 
+                            // ✅ FIX-VTT: لو فيه ملف ترجمة .vtt بنفس اسم الفيديو في نفس
+                            // المجلد، نقرأه ونرجّعه — يتحمّل تلقائيًا أثناء التشغيل
+                            var subtitleVtt: String? = null
+                            try {
+                              val vidFile = File(filePath)
+                              val vttFile = File(vidFile.parentFile, vidFile.nameWithoutExtension + ".vtt")
+                              if (vttFile.exists() && vttFile.length() in 1..2_000_000) {
+                                subtitleVtt = vttFile.readText(Charsets.UTF_8)
+                              }
+                            } catch (_: Exception) {}
+
                             videos.add(mapOf(
-                              "filePath"  to filePath,
-                              "title"     to name.substringBeforeLast('.'),
-                              "duration"  to dur,
-                              "thumbnail" to thumbB64
+                              "filePath"    to filePath,
+                              "title"       to name.substringBeforeLast('.'),
+                              "duration"    to dur,
+                              "thumbnail"   to thumbB64,
+                              "subtitleVtt" to subtitleVtt
                             ))
                           }
                         }
                         result.success(videos)
                       } catch (e: Exception) {
                         result.error("VIDEO_ERROR", e.message ?: "Unknown error", null)
+                      }
+                    }
+
+                    // ✅ FIX-MUSIC: مكتبة الموسيقى — MediaStore.Audio + غلاف الألبوم
+                    // المضمّن في الملف نفسه (أدق وأشمل من عمود الألبوم القديم المهجور)
+                    "getDeviceAudios" -> {
+                      try {
+                        val audios = mutableListOf<Map<String, Any?>>()
+                        val projection = arrayOf(
+                          MediaStore.Audio.Media._ID,
+                          MediaStore.Audio.Media.TITLE,
+                          MediaStore.Audio.Media.ARTIST,
+                          MediaStore.Audio.Media.DURATION,
+                          MediaStore.Audio.Media.DATA
+                        )
+                        val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0"
+                        val sortOrder = "${MediaStore.Audio.Media.DATE_MODIFIED} DESC"
+                        val cursor: Cursor? = contentResolver.query(
+                          MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                          projection, selection, null, sortOrder
+                        )
+                        cursor?.use { c ->
+                          val titleCol  = c.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
+                          val artistCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
+                          val durCol    = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+                          val dataCol   = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
+                          val retriever = MediaMetadataRetriever()
+                          while (c.moveToNext() && audios.size < 300) {
+                            val title    = c.getString(titleCol) ?: "Unknown"
+                            val artist   = c.getString(artistCol) ?: ""
+                            val dur      = c.getLong(durCol) / 1000.0
+                            val filePath = c.getString(dataCol) ?: ""
+                            if (filePath.isEmpty() || !File(filePath).exists()) continue
+
+                            var thumbB64 = ""
+                            try {
+                              retriever.setDataSource(filePath)
+                              val art = retriever.embeddedPicture
+                              if (art != null) {
+                                thumbB64 = "data:image/jpeg;base64," +
+                                  Base64.encodeToString(art, Base64.NO_WRAP)
+                              }
+                            } catch (_: Exception) {}
+
+                            audios.add(mapOf(
+                              "filePath" to filePath,
+                              "title"    to title,
+                              "artist"   to (if (artist == "<unknown>") "" else artist),
+                              "duration" to dur,
+                              "thumbnail" to thumbB64
+                            ))
+                          }
+                          try { retriever.release() } catch (_: Exception) {}
+                        }
+                        result.success(audios)
+                      } catch (e: Exception) {
+                        result.error("AUDIO_ERROR", e.message ?: "Unknown error", null)
+                      }
+                    }
+
+                    // ✅ FIX-PHOTOS: مكتبة الصور — MediaStore.Images
+                    "getDeviceImages" -> {
+                      try {
+                        val images = mutableListOf<Map<String, Any?>>()
+                        val projection = arrayOf(
+                          MediaStore.Images.Media._ID,
+                          MediaStore.Images.Media.DISPLAY_NAME,
+                          MediaStore.Images.Media.DATA,
+                          MediaStore.Images.Media.DATE_MODIFIED
+                        )
+                        val sortOrder = "${MediaStore.Images.Media.DATE_MODIFIED} DESC"
+                        val cursor: Cursor? = contentResolver.query(
+                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                          projection, null, null, sortOrder
+                        )
+                        cursor?.use { c ->
+                          val idCol   = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                          val nameCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+                          val dataCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATA)
+                          val dateCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
+                          while (c.moveToNext() && images.size < 500) {
+                            val id       = c.getLong(idCol)
+                            val name     = c.getString(nameCol) ?: "Image"
+                            val filePath = c.getString(dataCol) ?: ""
+                            val dateMod  = c.getLong(dateCol)
+                            if (filePath.isEmpty() || !File(filePath).exists()) continue
+                            val imgUri = Uri.withAppendedPath(
+                              MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString()
+                            )
+                            var thumbB64 = ""
+                            try {
+                              val bmp: Bitmap? = if (Build.VERSION.SDK_INT >= 29) {
+                                contentResolver.loadThumbnail(imgUri, android.util.Size(160, 160), null)
+                              } else {
+                                @Suppress("DEPRECATION")
+                                MediaStore.Images.Thumbnails.getThumbnail(
+                                  contentResolver, id, MediaStore.Images.Thumbnails.MINI_KIND, null
+                                )
+                              }
+                              if (bmp != null) {
+                                val bos = ByteArrayOutputStream()
+                                bmp.compress(Bitmap.CompressFormat.JPEG, 65, bos)
+                                thumbB64 = "data:image/jpeg;base64," +
+                                  Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+                                bmp.recycle()
+                              }
+                            } catch (_: Exception) {}
+
+                            images.add(mapOf(
+                              "filePath"  to filePath,
+                              "title"     to name.substringBeforeLast('.'),
+                              "dateAdded" to dateMod,
+                              "thumbnail" to thumbB64
+                            ))
+                          }
+                        }
+                        result.success(images)
+                      } catch (e: Exception) {
+                        result.error("IMAGE_ERROR", e.message ?: "Unknown error", null)
+                      }
+                    }
+
+                    // ✅ FIX-DELETE: حذف فعلي من الجهاز — يطلب موافقة المستخدم على
+                    // أندرويد 10/11+ زي ما النظام بيتطلب لحماية ملفات المستخدم
+                    "deleteDeviceFile" -> {
+                      val filePath = call.argument<String>("filePath") ?: ""
+                      try {
+                        val uri = getMediaStoreUri(filePath)
+                        if (uri == null) {
+                          result.error("NOT_FOUND", "File not found in MediaStore", null)
+                          return@setMethodCallHandler
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                          pendingDeleteResult = result
+                          val pi = MediaStore.createDeleteRequest(contentResolver, listOf(uri))
+                          startIntentSenderForResult(pi.intentSender, DELETE_REQUEST_CODE, null, 0, 0, 0)
+                        } else {
+                          try {
+                            contentResolver.delete(uri, null, null)
+                            result.success("deleted")
+                          } catch (se: SecurityException) {
+                            if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && se is RecoverableSecurityException) {
+                              pendingDeleteResult = result
+                              startIntentSenderForResult(
+                                se.userAction.actionIntent.intentSender, DELETE_REQUEST_CODE, null, 0, 0, 0
+                              )
+                            } else {
+                              result.error("DELETE_ERROR", se.message ?: "Permission denied", null)
+                            }
+                          }
+                        }
+                      } catch (e: Exception) {
+                        result.error("DELETE_ERROR", e.message ?: "Unknown error", null)
+                      }
+                    }
+
+                    // ✅ FIX-SHARE: مشاركة فيديو/صوت/صورة لتطبيقات أخرى عبر content:// URI
+                    "shareDeviceFile" -> {
+                      val filePath = call.argument<String>("filePath") ?: ""
+                      val mimeType = call.argument<String>("mimeType") ?: "*/*"
+                      try {
+                        val uri = getMediaStoreUri(filePath)
+                        if (uri == null) {
+                          result.error("NOT_FOUND", "File not found in MediaStore", null)
+                          return@setMethodCallHandler
+                        }
+                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                          type = mimeType
+                          putExtra(Intent.EXTRA_STREAM, uri)
+                          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(Intent.createChooser(shareIntent, "Share"))
+                        result.success("shared")
+                      } catch (e: Exception) {
+                        result.error("SHARE_ERROR", e.message ?: "Unknown error", null)
                       }
                     }
 
@@ -1850,34 +2367,48 @@ jobs:
         if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           cd "${{ env.APP_SLUG }}"
-          flutter build apk --release
+          flutter build apk --release \
+            --build-name="${{ env.RESOLVED_VERSION_NAME }}" \
+            --build-number="${{ env.RESOLVED_VERSION_CODE }}"
 
       # ── Step 11: Build AAB ──────────────────────────────────────────────────
       - name: Build AAB
         if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           cd "${{ env.APP_SLUG }}"
-          flutter build appbundle --release
+          flutter build appbundle --release \
+            --build-name="${{ env.RESOLVED_VERSION_NAME }}" \
+            --build-number="${{ env.RESOLVED_VERSION_CODE }}"
 
       # ── Step 12: Generate Keystore & Sign ───────────────────────────────────
+      # ✅ FIX-UPDATE: لو فيه keystore سابق لنفس التطبيق نستخدمه بنفس التوقيع
+      # (شرط أساسي عشان أندرويد يقبل التحديث) — غير كذا نولّد واحد جديد ونحفظه
       - name: Generate Keystore and Sign APK
         if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
           APP_SLUG=${{ env.APP_SLUG }}
           APP_NAME="${{ github.event.inputs.app_name }}"
-          TRACKING="${{ github.event.inputs.tracking_id }}"
 
-          ALIAS="titan-$(echo $TRACKING | cut -c1-8)"
-          KS_PASS="$(openssl rand -hex 16)"
-          KEY_PASS="$KS_PASS"
+          if [ "${{ env.KEYSTORE_REUSED }}" = "true" ] && [ -f /tmp/keystore_cache/release.jks ]; then
+            echo "♻️ Reusing existing keystore — this build will install as an UPDATE"
+            cp /tmp/keystore_cache/release.jks /tmp/release.jks
+            ALIAS="${{ env.KEY_ALIAS }}"
+            KS_PASS="${{ env.KS_PASS }}"
+            KEY_PASS="${{ env.KEY_PASS }}"
+          else
+            echo "🆕 No previous keystore for '$APP_SLUG' — generating one (will persist for future updates)"
+            ALIAS="titan-${APP_SLUG}"
+            KS_PASS="$(openssl rand -hex 16)"
+            KEY_PASS="$KS_PASS"
 
-          keytool -genkey -v \
-            -keystore /tmp/release.jks \
-            -storetype PKCS12 \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -alias "$ALIAS" \
-            -storepass "$KS_PASS" \
-            -dname "CN=$APP_NAME, OU=App, O=Titan, L=City, S=State, C=US"
+            keytool -genkey -v \
+              -keystore /tmp/release.jks \
+              -storetype PKCS12 \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -alias "$ALIAS" \
+              -storepass "$KS_PASS" \
+              -dname "CN=$APP_NAME, OU=App, O=Titan, L=City, S=State, C=US"
+          fi
 
           BUILD_TOOLS=$(ls -d $ANDROID_SDK_ROOT/build-tools/* | tail -1)
 
@@ -1892,6 +2423,46 @@ jobs:
           echo "KS_PASS=$KS_PASS"   >> $GITHUB_ENV
           echo "KEY_PASS=$KEY_PASS"  >> $GITHUB_ENV
           cp /tmp/release.jks /tmp/release-keystore.jks
+
+      # ✅ FIX-UPDATE: نحفظ الـ keystore + رقم النسخة في HF Dataset عشان
+      # البناء الجاي لنفس التطبيق يلاقيهم ويقدر يتثبّت كتحديث بدل ما يتعارض
+      - name: Persist Keystore & Version for Future Updates
+        if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
+        run: |
+          python3 - << 'PYEOF'
+          import json, os
+          from huggingface_hub import HfApi
+
+          api = HfApi()
+          app_slug   = os.environ["APP_SLUG"]
+          hf_dataset = "${{ github.event.inputs.hf_dataset }}"
+          hf_token   = "${{ github.event.inputs.hf_token }}"
+
+          meta = {
+              "key_alias":    "${{ env.KEY_ALIAS }}",
+              "ks_pass":      "${{ env.KS_PASS }}",
+              "key_pass":     "${{ env.KEY_PASS }}",
+              "version_name": "${{ env.RESOLVED_VERSION_NAME }}",
+              "version_code": "${{ env.RESOLVED_VERSION_CODE }}",
+          }
+          with open("/tmp/keystore_meta.json", "w") as f:
+              json.dump(meta, f)
+
+          try:
+              api.upload_file(
+                  path_or_fileobj="/tmp/release-keystore.jks",
+                  path_in_repo=f"keystores/{app_slug}.jks",
+                  repo_id=hf_dataset, repo_type="dataset", token=hf_token,
+              )
+              api.upload_file(
+                  path_or_fileobj="/tmp/keystore_meta.json",
+                  path_in_repo=f"keystores/{app_slug}.json",
+                  repo_id=hf_dataset, repo_type="dataset", token=hf_token,
+              )
+              print(f"✅ Keystore + version persisted for '{app_slug}' — next build will update cleanly")
+          except Exception as e:
+              print(f"⚠️ Could not persist keystore (future builds will start fresh): {e}")
+          PYEOF
 
       # ── Step 13: Create Release Package ─────────────────────────────────────
       - name: Create Release Package
