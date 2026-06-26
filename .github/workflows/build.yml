@@ -1,4 +1,4 @@
-name: Titan WebView Builder Pro v3 (Unified)
+name: Titan WebView Builder Pro v4 (Unified)
 
 on:
   workflow_dispatch:
@@ -89,7 +89,7 @@ jobs:
       # التطبيق (بنفس الاسم → نفس APP_SLUG).
       - name: Resolve Persistent Keystore & Version
         run: |
-          APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          export APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
           echo "APP_SLUG=$APP_SLUG" >> $GITHUB_ENV
 
           pip install huggingface_hub -q
