@@ -1,4 +1,4 @@
-name: Titan WebView Builder Pro v4 (Unified)
+name: Titan WebView Builder Pro v3 (Unified)
 
 on:
   workflow_dispatch:
@@ -9,6 +9,10 @@ on:
       app_name:
         description: 'Name of the app'
         required: true
+      package_slug:
+        description: 'Optional: fixed technical ID for updates (e.g. "titan_main"). Leave empty to auto-generate from app_name — but then renaming the app breaks update-compatibility with older installs.'
+        required: false
+        default: ''
       icon_url:
         description: 'Icon URL (Optional)'
         required: false
@@ -57,6 +61,10 @@ on:
         description: 'Version code, must increase each update — leave empty to auto-increment'
         required: false
         default: ''
+      google_services_json:
+        description: 'Optional: full content of google-services.json — enables real push notifications even when the app is fully closed (native FCM). Leave empty to skip.'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -89,7 +97,14 @@ jobs:
       # التطبيق (بنفس الاسم → نفس APP_SLUG).
       - name: Resolve Persistent Keystore & Version
         run: |
-          export APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          # ✅ FIX-COMPAT: لو المستخدم حدد package_slug صريح، ده اللي يحدد
+          # التوافق — مش اسم العرض (app_name) اللي ممكن يتغيّر بين بناء وبناء
+          PKG_SLUG_INPUT="${{ github.event.inputs.package_slug }}"
+          if [ -n "$PKG_SLUG_INPUT" ]; then
+            export APP_SLUG=$(echo "$PKG_SLUG_INPUT" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          else
+            export APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          fi
           echo "APP_SLUG=$APP_SLUG" >> $GITHUB_ENV
 
           pip install huggingface_hub -q
@@ -187,7 +202,12 @@ jobs:
               f.write(f'MANIFEST_NAME={os.environ.get(\"APP_NAME\",\"App\")}\n')
           " || true
 
-          APP_SLUG=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          PKG_SLUG_INPUT="${{ github.event.inputs.package_slug }}"
+          if [ -n "$PKG_SLUG_INPUT" ]; then
+            APP_SLUG=$(echo "$PKG_SLUG_INPUT" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          else
+            APP_SLUG=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          fi
           echo "APP_SLUG=$APP_SLUG" >> $GITHUB_ENV
 
           # Download icon
@@ -310,7 +330,15 @@ jobs:
       - name: Create Flutter WebView project
         if: env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE
         run: |
-          APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          # ✅ FIX-COMPAT: نفس منطق package_slug — هنا بالتحديد بيتحدد
+          # applicationId الفعلي (com.titan.$APP_SLUG) اللي أندرويد بيقارن
+          # بيه عشان يقرر "تحديث" ولا "تطبيق منفصل"
+          PKG_SLUG_INPUT="${{ github.event.inputs.package_slug }}"
+          if [ -n "$PKG_SLUG_INPUT" ]; then
+            APP_SLUG=$(echo "$PKG_SLUG_INPUT" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          else
+            APP_SLUG=$(echo "${{ github.event.inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+          fi
           echo "APP_SLUG=$APP_SLUG" >> $GITHUB_ENV
 
           flutter create --platforms=android --project-name "$APP_SLUG" --org com.titan "$APP_SLUG"
@@ -357,6 +385,50 @@ jobs:
           open(filepath, 'w').write(content)
           print("✅ Gradle patched successfully")
           PYEOF
+
+      # ✅ FIX-NOTIF: إشعارات حقيقية حتى لو التطبيق مقفول تمامًا — الإشعار
+      # العادي اللي بنينا قبل كذا شغال بس لما JS الموقع شغّال (التطبيق مفتوح
+      # أو في الخلفية). لو التطبيق مقفول تمامًا مفيش JS يشتغل خالص، فمحتاجين
+      # FCM أصلي عشان أندرويد نفسه يستقبل الإشعار من جوجل بدون التطبيق شغال.
+      # ده شرطي تمامًا — لو معندناش google_services_json نتجاوز الخطوة دي
+      # كاملة وكل شيء يفضل يعمل بالظبط زي قبل (من غير أي خطر على البناء).
+      - name: Enable Firebase Cloud Messaging (optional)
+        if: (env.BUILD_TYPE == 'webview' || env.BUILD_TYPE == '' || !env.BUILD_TYPE) && github.event.inputs.google_services_json != ''
+        run: |
+          APP_SLUG=${{ env.APP_SLUG }}
+          echo "FCM_ENABLED=true" >> $GITHUB_ENV
+
+          cat > "$APP_SLUG/android/app/google-services.json" << 'GSJSON'
+          ${{ github.event.inputs.google_services_json }}
+          GSJSON
+
+          # تفعيل بلجن google-services على مستوى المشروع (الملف الجذري)
+          ROOT_GRADLE=$(find "$APP_SLUG/android" -maxdepth 1 -name "build.gradle*" | head -1)
+          python3 - "$ROOT_GRADLE" << 'PYEOF'
+          import re, sys
+          filepath = sys.argv[1]
+          content = open(filepath).read()
+          line = "        classpath 'com.google.gms:google-services:4.4.2'"
+          if 'com.google.gms:google-services' not in content:
+              content = re.sub(
+                  r'(buildscript\s*\{[^}]*?dependencies\s*\{)',
+                  r'\1\n' + line,
+                  content, count=1, flags=re.DOTALL
+              )
+              open(filepath, 'w').write(content)
+              print("✅ Root gradle patched with google-services classpath")
+          PYEOF
+
+          # تفعيل البلجن على مستوى التطبيق (في آخر الملف، الطريقة المعتادة)
+          APP_GRADLE=$(find "$APP_SLUG/android/app" -maxdepth 1 -name "build.gradle*" | head -1)
+          if ! grep -q "com.google.gms.google-services" "$APP_GRADLE"; then
+            echo "" >> "$APP_GRADLE"
+            echo "apply plugin: 'com.google.gms.google-services'" >> "$APP_GRADLE"
+          fi
+
+          cd "$APP_SLUG"
+          flutter pub add firebase_core firebase_messaging
+          echo "✅ Firebase Cloud Messaging enabled for this build"
 
       # ── Step 3: AndroidManifest permissions & settings ─────────────────────
       - name: Inject Permissions and Manifest Settings
@@ -566,6 +638,7 @@ jobs:
           import 'package:audio_service/audio_service.dart';
           import 'package:just_audio/just_audio.dart';
           import 'package:dio/dio.dart';
+          // FCM_IMPORTS_PLACEHOLDER
 
           const String kAppUrl  = 'PLACEHOLDER_URL';
           const String kAppName = 'PLACEHOLDER_NAME';
@@ -789,8 +862,11 @@ jobs:
 
           TitanAudioHandler? _audioHandler;
 
+          // FCM_BACKGROUND_HANDLER_PLACEHOLDER
+
           void main() async {
             WidgetsFlutterBinding.ensureInitialized();
+            // FCM_INIT_PLACEHOLDER
 
             try {
               _audioHandler = await AudioService.init(
@@ -865,6 +941,7 @@ jobs:
               _checkConnectivity();
               _resolveInitialSource(); // ✅ FIX-OFFLINE
               _setupShareHandling(); // ✅ FIX-SHARE: استقبال مشاركات من تطبيقات تانية
+              // FCM_INIT_LISTENERS_PLACEHOLDER
               Connectivity().onConnectivityChanged.listen((r) {
                 if (!mounted) return;
                 final wasOffline = _offline;
@@ -1637,6 +1714,7 @@ jobs:
                           await p.setString('lastUrl', url?.toString() ?? kAppUrl);
                           _setupMediaBridge(c);
                           _cacheShellForOffline(); // ✅ FIX-OFFLINE: تحديث النسخة المحفوظة
+                          // FCM_PUSH_TOKEN_PLACEHOLDER
                         },
                         onReceivedError: (c, req, err) {
                           if (req.isForMainFrame == true && mounted)
@@ -1873,11 +1951,14 @@ jobs:
                 val channel = NotificationChannel(
                   NOTIF_CHANNEL,
                   "Titan Notifications",
-                  NotificationManager.IMPORTANCE_DEFAULT
+                  // ✅ FIX-NOTIF: IMPORTANCE_DEFAULT كانت بتمنع ظهور heads-up
+                  // (التنبيه المنبثق فوق الشاشة) — تطبيقات الشات لازم HIGH
+                  NotificationManager.IMPORTANCE_HIGH
                 ).apply {
                   description = "App notifications"
                   enableLights(true)
                   enableVibration(true)
+                  setShowBadge(true)
                 }
                 val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 nm.createNotificationChannel(channel)
@@ -1944,11 +2025,12 @@ jobs:
                             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                           )}
                         val notif = NotificationCompat.Builder(this, NOTIF_CHANNEL)
-                          .setSmallIcon(android.R.drawable.ic_dialog_info)
+                          // ✅ FIX-NOTIF: أيقونة التطبيق الحقيقية بدل أيقونة نظام عامة (i)
+                          .setSmallIcon(R.mipmap.ic_launcher)
                           .setContentTitle(title)
                           .setContentText(body)
                           .setAutoCancel(true)
-                          .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                          .setPriority(NotificationCompat.PRIORITY_HIGH)
                           .apply { if (pi != null) setContentIntent(pi) }
                           .build()
                         nm.notify(System.currentTimeMillis().toInt(), notif)
@@ -2325,6 +2407,102 @@ jobs:
           sed -i "s|PLACEHOLDER_NOTIFICATIONS|$NOTIF|g"       "$APP_SLUG/lib/main.dart"
           sed -i "s|PLACEHOLDER_CAMERA|$CAM|g"                "$APP_SLUG/lib/main.dart"
           sed -i "s|PLACEHOLDER_STORAGE|$STOR|g"              "$APP_SLUG/lib/main.dart"
+
+      # ✅ FIX-NOTIF: نستبدل العلامات بكود FCM حقيقي بس لو google_services_json
+      # متوفر — غير كذا العلامات تفضل تعليقات عادية بلا أي تأثير على البناء
+      - name: Inject Firebase Messaging Code (optional)
+        if: env.FCM_ENABLED == 'true'
+        run: |
+          APP_SLUG=${{ env.APP_SLUG }}
+          python3 - "$APP_SLUG/lib/main.dart" << 'PYEOF'
+          import sys
+          filepath = sys.argv[1]
+          content = open(filepath, encoding='utf-8').read()
+
+          content = content.replace(
+              "// FCM_IMPORTS_PLACEHOLDER",
+              "import 'package:firebase_core/firebase_core.dart';\n"
+              "          import 'package:firebase_messaging/firebase_messaging.dart';"
+          )
+
+          content = content.replace(
+              "// FCM_BACKGROUND_HANDLER_PLACEHOLDER",
+              "@pragma('vm:entry-point')\n"
+              "          Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {\n"
+              "            // ✅ أندرويد بيعرض إشعار النظام تلقائيًا للرسائل اللي فيها\n"
+              "            // notification payload حتى لو التطبيق مقفول تمامًا — مفيش\n"
+              "            // كود مطلوب هنا للحالة الشائعة دي. الهاندلر ده نقطة توسعة\n"
+              "            // لمعالجة رسائل data-only مستقبلًا لو احتجتوا.\n"
+              "            debugPrint('FCM background message: ' + message.messageId.toString());\n"
+              "          }"
+          )
+
+          content = content.replace(
+              "// FCM_INIT_PLACEHOLDER",
+              "try {\n"
+              "              await Firebase.initializeApp();\n"
+              "              FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);\n"
+              "            } catch (e) { debugPrint('Firebase init skipped: $e'); }"
+          )
+
+          content = content.replace(
+              "// FCM_INIT_LISTENERS_PLACEHOLDER",
+              "_setupFcmListeners(); // ✅ FIX-NOTIF: إشعارات حقيقية حتى لو التطبيق مقفول"
+          )
+
+          content = content.replace(
+              "// FCM_PUSH_TOKEN_PLACEHOLDER",
+              "_pushFcmTokenToSite(); // ✅ FIX-NOTIF: نبعت التوكن للموقع يحفظه في الباك إند"
+          )
+
+          # الدوال الفعلية بتتحط آخر الكلاس — قبل آخر قوس قفل بتاع _WebViewPageState
+          extra_methods = '''
+            // ✅ FIX-NOTIF: رسائل وارِدة والتطبيق مفتوح — أندرويد ما يعرضهاش
+            // تلقائيًا في هذه الحالة، فلازم نعرضها بأنفسنا عبر نفس قناة
+            // الإشعارات المستخدمة في باقي التطبيق
+            void _setupFcmListeners() {
+              try {
+                FirebaseMessaging.instance.requestPermission(alert: true, badge: true, sound: true);
+                FirebaseMessaging.onMessage.listen((RemoteMessage message) async {
+                  final title = message.notification?.title ?? message.data['title'] ?? kAppName;
+                  final body  = message.notification?.body  ?? message.data['body']  ?? '';
+                  if (title.isEmpty && body.isEmpty) return;
+                  try {
+                    const ch = MethodChannel('titan_download');
+                    await ch.invokeMethod('showNotification', {'title': title, 'body': body});
+                  } catch (_) {}
+                });
+              } catch (e) { debugPrint('_setupFcmListeners: $e'); }
+            }
+
+            // ✅ FIX-NOTIF: نبعت توكن FCM الأصلي للموقع — الباك إند بتاعكم محتاج
+            // يحفظه بجانب push token الويب العادي عشان يقدر يبعت إشعارات
+            // حقيقية تطلع حتى والتطبيق مقفول تمامًا (عبر Firebase Admin SDK)
+            Future<void> _pushFcmTokenToSite() async {
+              try {
+                final token = await FirebaseMessaging.instance.getToken();
+                if (token == null || token.isEmpty) return;
+                await _ctrl?.evaluateJavascript(source:
+                    "window.titanNativeFcmToken = '$token';"
+                    "window.dispatchEvent(new CustomEvent('titanFcmToken', {detail:'$token'}));");
+              } catch (e) { debugPrint('_pushFcmTokenToSite: $e'); }
+            }
+          '''
+
+          # الدوال الفعلية بتتحط آخر الكلاس — قبل آخر قوس قفل في نهاية الملف
+          # تمامًا (قوس الكلاس)، مش أي قوس عشوائي قبله
+          import re
+          m = re.search(r'\n(?P<indent>[ \t]*)\}\s*$', content)
+          if m:
+              indent = m.group('indent')
+              insert_at = m.start()
+              content = content[:insert_at] + '\n' + extra_methods + content[insert_at:]
+          else:
+              print("⚠️ couldn't locate class-closing brace — skipping method injection")
+
+          open(filepath, 'w', encoding='utf-8').write(content)
+          print("✅ Firebase Messaging code injected")
+          PYEOF
 
       # ── Step 8: App Icon handling ───────────────────────────────────────────
       - name: Handle App Icon
