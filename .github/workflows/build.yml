@@ -1,4 +1,4 @@
-name: Titan WebView Builder Pro v3 (Unified)
+name: Titan WebView Builder Pro v7 (Unified)
 
 on:
   workflow_dispatch:
@@ -933,6 +933,10 @@ jobs:
             bool   _useOfflineShell  = false;
             String _cachedShellHtml  = '';
 
+            // ✅ FIX-BANNER: بانر "وضع عدم الاتصال" بقى مؤقت — يظهر ويختفي
+            // تلقائيًا، مش بيفضل معروض طول مدة انعدام النت (كان بيحجب الرؤية)
+            bool _offlineBannerVisible = false;
+
             @override
             void initState() {
               super.initState();
@@ -947,12 +951,17 @@ jobs:
                 final wasOffline = _offline;
                 final nowOffline = r.contains(ConnectivityResult.none);
                 setState(() => _offline = nowOffline);
-                // ✅ FIX-OFFLINE: نخلي الـ WebView يفضّل الكاش وقت انعدام النت،
-                // ويرجع للسلوك الطبيعي (محتوى محدّث) لما النت يرجع
-                _ctrl?.setSettings(settings: InAppWebViewSettings(
-                  cacheMode: nowOffline ? CacheMode.LOAD_CACHE_ELSE_NETWORK : CacheMode.LOAD_DEFAULT,
-                  networkAvailable: !nowOffline,
-                ));
+                // ✅ FIX-CRASH: شِلنا استدعاء setSettings اللي كان هنا. السبب:
+                // setSettings(InAppWebViewSettings(field1: x, field2: y)) بيبني
+                // كائن إعدادات جديد بحقلين بس محددين — والباقي (userAgent،
+                // allowUniversalAccessFromFileURLs، mixedContentMode، إلخ)
+                // بيرجع للقيمة الافتراضية لمكتبة flutter_inappwebview نفسها،
+                // مش لقيمتنا الأصلية وقت إنشاء الـ WebView. وده كان بيكسر
+                // وصول الموقع لمصادره فجأة (خصوصًا وقت استخدام initialData
+                // للنسخة المحفوظة أوفلاين) ويظهر للمستخدم كأنه "خرج من التطبيق".
+                // الـ cacheMode الابتدائي (محدد مرة واحدة عند إنشاء الـ WebView
+                // بناءً على _useOfflineShell) كافي وحده، ومحرك Chromium نفسه
+                // بيتابع حالة الاتصال الفعلية من نظام أندرويد تلقائيًا.
                 if (wasOffline && !_offline && _error) _ctrl?.reload();
               });
             }
@@ -968,10 +977,21 @@ jobs:
                   if (await file.exists()) {
                     _cachedShellHtml = await file.readAsString();
                     _useOfflineShell = _cachedShellHtml.trim().isNotEmpty;
+                    if (_useOfflineShell) _flashOfflineBanner(); // ✅ FIX-BANNER
                   }
                 }
               } catch (e) { debugPrint('_resolveInitialSource: $e'); }
               if (mounted) setState(() => _initDecisionMade = true);
+            }
+
+            // ✅ FIX-BANNER: يظهر البانر لثوانٍ معدودة بس، وبعدين يختفي تلقائيًا
+            // — حتى لو النت لسه مقطوع، عشان ميفضلش يحجب الشاشة طول الوقت
+            void _flashOfflineBanner() {
+              if (!mounted) return;
+              setState(() => _offlineBannerVisible = true);
+              Future.delayed(const Duration(seconds: 3), () {
+                if (mounted) setState(() => _offlineBannerVisible = false);
+              });
             }
 
             // ✅ FIX-OFFLINE: نخزّن نسخة من الصفحة بعد كل تحميل ناجح عن طريق
@@ -1769,15 +1789,24 @@ jobs:
                           child: LinearProgressIndicator(
                             backgroundColor: Colors.transparent, color: Colors.blue, minHeight: 3)),
 
-                      // ✅ FIX-OFFLINE: شريط بسيط يوضّح إنك شغال على نسخة محفوظة
-                      if (_offline && _useOfflineShell)
+                      // ✅ FIX-BANNER: بانر مؤقت يظهر ويختفي بسلاسة (Fade) —
+                      // مش مربوط بحالة الاتصال المستمرة، فمش بيحجب الشاشة طول
+                      // مدة انعدام النت زي ما كان بيحصل قبل كذا
+                      if (_useOfflineShell)
                         Positioned(top: 0, left: 0, right: 0,
-                          child: Container(
-                            color: const Color(0xFF424242),
-                            padding: const EdgeInsets.symmetric(vertical: 6),
-                            child: const Text('وضع عدم الاتصال — تعرض بيانات محفوظة',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(color: Colors.white, fontSize: 12)),
+                          child: IgnorePointer(
+                            ignoring: !_offlineBannerVisible,
+                            child: AnimatedOpacity(
+                              opacity: _offlineBannerVisible ? 1.0 : 0.0,
+                              duration: const Duration(milliseconds: 400),
+                              child: Container(
+                                color: const Color(0xFF424242),
+                                padding: const EdgeInsets.symmetric(vertical: 6),
+                                child: const Text('وضع عدم الاتصال — تعرض بيانات محفوظة',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(color: Colors.white, fontSize: 12)),
+                              ),
+                            ),
                           )),
 
                       // ✅ FIX-OFFLINE: نخفي شاشة "مفيش نت" دي لو فاتحين أصلاً من
@@ -2475,16 +2504,35 @@ jobs:
               } catch (e) { debugPrint('_setupFcmListeners: $e'); }
             }
 
-            // ✅ FIX-NOTIF: نبعت توكن FCM الأصلي للموقع — الباك إند بتاعكم محتاج
-            // يحفظه بجانب push token الويب العادي عشان يقدر يبعت إشعارات
-            // حقيقية تطلع حتى والتطبيق مقفول تمامًا (عبر Firebase Admin SDK)
+            // ✅ FIX-NOTIF (مُصحَّح بناءً على كود الموقع الفعلي): الموقع بيقرأ
+            // توكن الـ FCM من localStorage['titan_fcm_token'] لحظة فتح أي
+            // اتصال WebSocket جديد (main.js: connect() → ws.onopen)، وبيتجاهل
+            // الإعداد الخاص بالويب بالكامل وهو شغال جوه تطبيقنا (لأن
+            // window.TitanBridge.isNative() بترجع true تلقائيًا بفضل
+            // flutter_inappwebview). الإصدار القديم كان بيكتب في متغيّر
+            // ومُحدَث (window.titanNativeFcmToken) ومُحدَث (custom event) محدش
+            // بيسمعهم فعليًا — التوكن كان بيتحط في الصفحة بلا أي تأثير حقيقي.
             Future<void> _pushFcmTokenToSite() async {
               try {
                 final token = await FirebaseMessaging.instance.getToken();
                 if (token == null || token.isEmpty) return;
-                await _ctrl?.evaluateJavascript(source:
-                    "window.titanNativeFcmToken = '$token';"
-                    "window.dispatchEvent(new CustomEvent('titanFcmToken', {detail:'$token'}));");
+                await _ctrl?.evaluateJavascript(source: """
+                  (function() {
+                    try {
+                      var t    = '$token';
+                      var prev = localStorage.getItem('titan_fcm_token');
+                      localStorage.setItem('titan_fcm_token', t);
+                      // لو التوكن جديد ومفيش اتصال حالي هياخده تلقائيًا قريب،
+                      // نجدد الاتصال عشان يتسجّل فورًا بدل ما يستنى أول
+                      // قطع/وصل طبيعي للنت (بيستخدم نفس آلية إعادة الاتصال
+                      // المدمجة في الموقع نفسها — مفيش أي تعديل لكودها)
+                      if (t !== prev && window.Titan && Titan.messenger &&
+                          Titan.messenger.ws && Titan.messenger.ws.readyState === 1) {
+                        Titan.messenger.ws.close();
+                      }
+                    } catch (e) { console.warn('[Titan FCM bridge]', e); }
+                  })();
+                """);
               } catch (e) { debugPrint('_pushFcmTokenToSite: $e'); }
             }
           '''
