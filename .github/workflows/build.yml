@@ -1,4 +1,4 @@
-name: Titan WebView Builder Pro v7 (Unified)
+name: Titan WebView Builder Pro v3 (Unified)
 
 on:
   workflow_dispatch:
@@ -820,6 +820,10 @@ jobs:
               // كان UUID الجديد بيخلي audio_service يعامله كمقطع جديد ويعيد تهيئة الإشعار
               final stableId = 'titan:${title.hashCode}';
 
+              // ✅ FIX-NOTIF-MEDIA: نبني الإشعار فورًا حتى لو duration=0 (لسه
+              // بيحمّل الـ metadata) — الانتظار لقيمة duration صحيحة قبل أول
+              // نداء لـ mediaItem.add() كان بيأخّر أو يمنع ظهور الإشعار في بعض
+              // الحالات؛ هنا بنبنيه فورًا وبعدين نحدّثه لما duration الحقيقية توصل
               mediaItem.add(MediaItem(
                 id:       stableId,
                 title:    title.isNotEmpty ? title : kAppName,
@@ -828,12 +832,13 @@ jobs:
                 playable: true,
                 duration: duration > 0
                     ? Duration(milliseconds: (duration * 1000).toInt())
-                    : null,
+                    : const Duration(seconds: 1), // placeholder غير صفري لحد ما تتحدث
               ));
 
-              if (playbackState.value.processingState == AudioProcessingState.idle) {
-                updatePlaybackState(true);
-              }
+              // ✅ FIX-NOTIF-MEDIA: أول نداء لازم يبني حالة "ready" فورًا —
+              // idle كانت ممكن تتسبب في عدم رفع الإشعار كـ foreground service
+              // فعلي في أول تشغيل، فبقى دايمًا يبدأ بحالة تشغيل واضحة
+              updatePlaybackState(true, position: position, duration: duration);
             }
 
             void updatePlaybackState(bool playing, {double position = 0, double duration = 0}) {
@@ -1334,6 +1339,63 @@ jobs:
                   if (window._tMediaBridgeReady) return; // منع التكرار عند كل onLoadStop
                   window._tMediaBridgeReady = true;
 
+                  // ══════════════════════════════════════════════════════════
+                  // ✅ FIX-NOTIF-CHAT: إشعارات الرسايل جوه WebView
+                  // ──────────────────────────────────────────────────────────
+                  // كروم بيعرض إشعار الرسايل عبر firebase-messaging-sw.js
+                  // (Service Worker) — والموقع نفسه بيعطّل الملف ده عمدًا جوه
+                  // تطبيقنا (window.TitanBridge.isNative() === true). فمحتاجين
+                  // بديل يقوم بنفس الدور من غير أي تعديل لكود الموقع أو أي
+                  // احتياج لإعداد Firebase Android منفصل (google-services.json).
+                  //
+                  // الحل: نراقب أي WebSocket جديد، ونضيف مستمع إضافي عبر
+                  // addEventListener('message', ...) — ده بيشتغل جنب onmessage
+                  // بتاع الموقع من غير ما يلغيه أو يعدّل عليه (سلوك قياسي في
+                  // WebSocket API، اتأكد منه بمحاكاة فعلية قبل التطبيق).
+                  //
+                  // window._tAppInBackground بيتحدث من Dart (didChangeAppLifecycleState)
+                  // عشان نعرض إشعار وقت التطبيق في الخلفية بس — مش وإحنا بصّينه
+                  if (typeof window._tAppInBackground === 'undefined') {
+                    window._tAppInBackground = false;
+                  }
+
+                  if (!window._tWsNotifPatched && window.WebSocket && window.flutter_inappwebview) {
+                    window._tWsNotifPatched = true;
+                    var _NativeWS = window.WebSocket;
+
+                    window.WebSocket = function(url, protocols) {
+                      var ws = protocols !== undefined
+                          ? new _NativeWS(url, protocols) : new _NativeWS(url);
+
+                      // نعترض بس على اتصال سيرفر الرسايل بتاعنا (ينتهي بـ /ws)
+                      // — أي WebSocket تاني (لو الموقع بيستخدم واحد لغرض تاني)
+                      // يفضل زي ما هو من غير أي تدخل
+                      var isTitanMessenger = /\/ws\/?(\?|$)/.test(url);
+                      if (!isTitanMessenger) return ws;
+
+                      ws.addEventListener('message', function(event) {
+                        if (!window._tAppInBackground) return; // بس وقت الخلفية
+                        try {
+                          var frame = JSON.parse(event.data);
+                          if (frame.type !== 'new_message' || !frame.data) return;
+                          var msg = frame.data;
+
+                          // المحتوى مشفّر من جوه (encrypted_payload) — نعرض
+                          // نص عام آمن بدل محاولة فك التشفير هنا (المفاتيح
+                          // بتتدار جوه سياق الشات المفتوح بس، مش عالميًا)
+                          window.flutter_inappwebview.callHandler('showNotification', {
+                            title: 'رسالة جديدة',
+                            body:  'وصلتك رسالة جديدة في تيتان كونيكت'
+                          }).catch(function(){});
+                        } catch (e) { console.warn('[Titan bg-notif]', e); }
+                      });
+
+                      return ws;
+                    };
+                    window.WebSocket.prototype = _NativeWS.prototype;
+                  }
+                  // ══════════════════════════════════════════════════════════
+
                   // ── 1. Media bridge ──────────────────────────────────────
                   // ✅ FIX-TITLE: بيحاول مصادر متعددة بترتيب أولوية
                   function _getTitle() {
@@ -1658,8 +1720,13 @@ jobs:
               if (state == AppLifecycleState.paused ||
                   state == AppLifecycleState.hidden) {
                 Future.delayed(Duration.zero, () => _ctrl?.resumeTimers());
+                // ✅ FIX-NOTIF-CHAT: نبلّغ الـ JS إن التطبيق بقى في الخلفية —
+                // من هنا لغاية ما يرجع resumed، أي رسالة واردة عبر الـ
+                // WebSocket تبني إشعار أندرويد أصلي (شوف الـ patch في الجافاسكريبت)
+                _ctrl?.evaluateJavascript(source: 'window._tAppInBackground = true;');
               } else if (state == AppLifecycleState.resumed) {
                 _ctrl?.resumeTimers();
+                _ctrl?.evaluateJavascript(source: 'window._tAppInBackground = false;');
               }
             }
 
